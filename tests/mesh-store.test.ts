@@ -6,6 +6,7 @@ import { encodeOwnerIdentityLine } from "../src/core/atomic-write.js";
 import { deadChildPid } from "./dead-child-pid.js";
 import {
   MeshStore,
+  type MeshEvent,
   type MeshIdentity,
   type MeshStateEntry,
   type MeshStoreOptions,
@@ -765,5 +766,191 @@ describe("MeshStore short-lock leaks (#323)", () => {
     // The reaper's rename-back now finds nothing to restore.
     expect(() => fs.renameSync(claim, lockPath)).toThrow();
     expect(fs.existsSync(lockPath)).toBe(false);
+  });
+});
+
+/** Deterministic PRNG so the randomized equivalence cases replay exactly. */
+const seededRandom = (seed: number): (() => number) => {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = Math.imul(state ^ (state >>> 15), 1 | state);
+    value = (value + Math.imul(value ^ (value >>> 7), 61 | value)) ^ value;
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+};
+
+type ReadInput = { after: number; topic?: string; to?: string; limit?: number };
+
+/**
+ * Independent reference for `read({ after })`: a whole-file linear scan with
+ * the documented line rules (a trailing CR is stripped, a line longer than
+ * maxEventBytes is skipped, malformed JSON is skipped, the partial trailing
+ * line still counts, results stop at `limit`).
+ */
+const referenceReadAfter = (file: string, maxEventBytes: number, input: ReadInput, maxReadEvents: number): MeshEvent[] => {
+  const limit = Math.max(1, Math.min(Math.floor(input.limit ?? 100), maxReadEvents));
+  const events: MeshEvent[] = [];
+  if (!fs.existsSync(file)) return events;
+  const raw = fs.readFileSync(file);
+  let start = 0;
+  while (start < raw.length && events.length < limit) {
+    const newline = raw.indexOf(0x0a, start);
+    const end = newline < 0 ? raw.length : newline;
+    const bytes = raw.subarray(start, end);
+    start = end + 1;
+    if (bytes.length === 0 || bytes.length > maxEventBytes) continue;
+    const decoded = bytes.toString("utf8");
+    const line = decoded.endsWith("\r") ? decoded.slice(0, -1) : decoded;
+    let event: MeshEvent;
+    try { event = JSON.parse(line) as MeshEvent; } catch { continue; }
+    if (typeof event.sequence !== "number" || event.sequence <= input.after) continue;
+    if (input.topic !== undefined && event.topic !== input.topic) continue;
+    if (input.to !== undefined && event.to !== input.to) continue;
+    events.push(event);
+  }
+  return events;
+};
+
+const eventLine = (sequence: number, overrides: Partial<MeshEvent> = {}, padding = 0): string =>
+  JSON.stringify({
+    id: `event-${sequence}`,
+    sequence,
+    topic: `team.lane-${sequence % 5}`,
+    kind: "message",
+    from: identity,
+    ...(sequence % 3 === 0 ? { to: `session:peer-${sequence % 4}` } : {}),
+    text: `event ${sequence} ${"x".repeat(padding)}`,
+    createdAt: 1_700_000_000_000 + sequence,
+    ...overrides,
+  });
+
+/** Builds a log with gaps, CRLF lines, malformed lines, oversized lines and an optional partial tail. */
+const buildLog = (count: number, maxEventBytes: number, random: () => number, partialTail: boolean): { text: string; last: number } => {
+  const lines: string[] = [];
+  let sequence = 0;
+  for (let index = 0; index < count; index++) {
+    sequence += 1 + Math.floor(random() * 3);
+    const roll = random();
+    if (roll < 0.05) lines.push("");
+    else if (roll < 0.1) lines.push("{not json");
+    else if (roll < 0.15) lines.push(JSON.stringify({ id: "no-sequence", topic: "team.lane-0" }));
+    else if (roll < 0.2) lines.push(eventLine(sequence, {}, maxEventBytes));
+    else if (roll < 0.3) lines.push(eventLine(sequence) + "\r");
+    else lines.push(eventLine(sequence, {}, Math.floor(random() * 200)));
+  }
+  let text = lines.join("\n") + "\n";
+  if (partialTail) text += eventLine(sequence + 1).slice(0, -5);
+  return { text, last: sequence };
+};
+
+describe("MeshStore read seek", () => {
+  const maxEventBytes = 2_048;
+  const createSeekStore = (eventBytes: number, options?: MeshStoreOptions): MeshStore => {
+    const store = new MeshStore(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mesh-")), eventBytes, 100, options);
+    roots.push(store.root);
+    return store;
+  };
+
+  it("matches a linear reference scan for random cursors, filters, malformed, oversized and partial lines", () => {
+    const random = seededRandom(0x5eed);
+    for (const partialTail of [false, true]) {
+      const store = createSeekStore(maxEventBytes);
+      const file = path.join(store.root, "events.jsonl");
+      const log = buildLog(3_000, maxEventBytes, random, partialTail);
+      fs.writeFileSync(file, log.text);
+      const cases: ReadInput[] = [
+        { after: 0 }, { after: log.last }, { after: log.last + 1 }, { after: log.last - 1 }, { after: 1 },
+        { after: Math.floor(log.last / 2), limit: 7 }, { after: 0, topic: "team.lane-2", limit: 50 },
+        { after: log.last - 40, to: "session:peer-3" },
+      ];
+      for (let index = 0; index < 150; index++) {
+        cases.push({
+          after: Math.floor(random() * (log.last + 10)),
+          ...(random() < 0.3 ? { topic: `team.lane-${Math.floor(random() * 5)}` } : {}),
+          ...(random() < 0.2 ? { to: `session:peer-${Math.floor(random() * 4)}` } : {}),
+          ...(random() < 0.5 ? { limit: 1 + Math.floor(random() * 60) } : {}),
+        });
+      }
+      for (const input of cases) {
+        const expected = referenceReadAfter(file, maxEventBytes, input, 100);
+        expect(store.read(input), JSON.stringify({ partialTail, input })).toEqual(expected);
+      }
+    }
+  });
+
+  it("matches the reference after the log is truncated by compaction", async () => {
+    const store = createSeekStore(1_024, { maxEventLogBytes: 20_000, retainedEventLogBytes: 6_000 });
+    for (let index = 0; index < 120; index++) {
+      await store.publish({ topic: `team.lane-${index % 3}`, from: identity, text: `event ${index} ${"y".repeat(150)}` });
+    }
+    const file = path.join(store.root, "events.jsonl");
+    expect(fs.statSync(file).size).toBeLessThan(20_000);
+    const latest = store.latestSequence();
+    const first = referenceReadAfter(file, 1_024, { after: 0, limit: 1 }, 100)[0]?.sequence ?? 0;
+    expect(first).toBeGreaterThan(1);
+    for (const after of [0, 1, first - 1, first, first + 1, latest - 10, latest - 1, latest, latest + 5]) {
+      for (const topic of [undefined, "team.lane-1"]) {
+        const input: ReadInput = { after, ...(topic ? { topic } : {}), limit: 100 };
+        expect(store.read(input), JSON.stringify(input)).toEqual(referenceReadAfter(file, 1_024, input, 100));
+      }
+    }
+  });
+
+  it("keeps sequence numbers strictly increasing in file order across compaction", async () => {
+    const store = createSeekStore(1_024, { maxEventLogBytes: 8_000, retainedEventLogBytes: 2_000 });
+    for (let index = 0; index < 200; index++) {
+      await store.publish({ topic: "team.auth", from: identity, text: `event ${index} ${"z".repeat(100)}` });
+      if (index % 25 === 0) {
+        // Even when the persisted counter is lost, the log tail re-seeds it.
+        fs.rmSync(path.join(store.root, "sequence"), { force: true });
+      }
+    }
+    expect(fs.statSync(path.join(store.root, "events.jsonl")).size).toBeLessThan(8_000);
+    const retained = referenceReadAfter(path.join(store.root, "events.jsonl"), 1_024, { after: 0, limit: 1_000 }, 1_000);
+    expect(retained.length).toBeGreaterThan(1);
+    const sequences = retained.map((event) => event.sequence);
+    for (let index = 1; index < sequences.length; index++) {
+      expect(sequences[index] ?? -1).toBeGreaterThan(sequences[index - 1] ?? Number.POSITIVE_INFINITY);
+    }
+  });
+
+  it("reads a bounded number of bytes for a cursor near the tail of a large log", () => {
+    const store = createSeekStore(64 * 1024);
+    const file = path.join(store.root, "events.jsonl");
+    const lines: string[] = [];
+    let sequence = 0;
+    let bytes = 0;
+    while (bytes < 8 * 1024 * 1024) {
+      sequence += 1;
+      const line = eventLine(sequence, {}, 200);
+      lines.push(line);
+      bytes += line.length + 1;
+    }
+    fs.writeFileSync(file, lines.join("\n") + "\n");
+    const size = fs.statSync(file).size;
+    let bytesRead = 0;
+    const realRead = fs.readSync;
+    vi.spyOn(fs, "readSync").mockImplementation(((...args: unknown[]) => {
+      const count = (realRead as (...inner: unknown[]) => number)(...args);
+      bytesRead += count;
+      return count;
+    }) as typeof fs.readSync);
+
+    bytesRead = 0;
+    expect(store.read({ after: sequence - 20, limit: 100 })).toHaveLength(20);
+    const nearTail = bytesRead;
+    bytesRead = 0;
+    expect(store.read({ after: sequence, limit: 100 })).toHaveLength(0);
+    const nothingNew = bytesRead;
+    bytesRead = 0;
+    expect(store.read({ after: Math.floor(sequence / 2), limit: 10 })).toHaveLength(10);
+    const middle = bytesRead;
+
+    // A seek reads O(log n) probes plus the result; a linear scan reads the file.
+    const budget = Math.floor(size / 8);
+    expect(nearTail, `near tail read ${nearTail} of ${size} bytes`).toBeLessThan(budget);
+    expect(nothingNew, `nothing-new read ${nothingNew} of ${size} bytes`).toBeLessThan(budget);
+    expect(middle, `middle read ${middle} of ${size} bytes`).toBeLessThan(budget);
   });
 });

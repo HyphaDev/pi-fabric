@@ -134,6 +134,8 @@ const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_STATE_TOMBSTONES = 10_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
+/** Initial window of one seek probe; grows (doubling) only while a line stays unterminated. */
+const EVENT_SEEK_PROBE_BYTES = 16 * 1024;
 const CURSOR_OFFSET_BASE = 2 ** 32;
 export const MESH_MAX_PENDING_SCHEDULES = 1_000;
 export const MESH_MAX_SCHEDULE_AHEAD_MS = 366 * 24 * 60 * 60 * 1_000;
@@ -796,7 +798,7 @@ export class MeshStore {
       descriptor = fs.openSync(this.#eventsPath, "r");
       const size = fs.fstatSync(descriptor).size;
       const events: MeshEvent[] = [];
-      let position = 0;
+      let position = this.#seekEventsAfter(descriptor, size, after);
       let lineChunks: Buffer[] = [];
       let lineBytes = 0;
       let skippingOversizedLine = false;
@@ -857,6 +859,102 @@ export class MeshStore {
       throw error;
     } finally {
       if (descriptor !== undefined) fs.closeSync(descriptor);
+    }
+  }
+
+  /**
+   * Finds a line boundary from which a forward scan still yields every event
+   * with `sequence > after`. Sequences are strictly increasing in file order:
+   * `#appendLocked` seeds each one from the persisted counter and the last
+   * logged line under the mesh lock, and compaction keeps a suffix of whole
+   * lines. A gallop back from the tail followed by a binary search therefore
+   * bounds the bytes read by the distance from `after` to the end of the log
+   * rather than by the log size. A probe that finds no decodable line only
+   * moves the start earlier, which keeps the forward scan exhaustive.
+   */
+  #seekEventsAfter(descriptor: number, size: number, after: number): number {
+    if (after <= 0 || size <= EVENT_READ_CHUNK_BYTES) return 0;
+    let low = 0;
+    let high = size;
+    for (let step = EVENT_SEEK_PROBE_BYTES; high - low > EVENT_READ_CHUNK_BYTES; step *= 2) {
+      const position = high - step;
+      if (position <= low) break;
+      const probe = this.#probeEventSequence(descriptor, position, high);
+      if (probe !== undefined && probe.sequence <= after) {
+        low = probe.lineEnd;
+        break;
+      }
+      high = position;
+    }
+    while (high - low > EVENT_READ_CHUNK_BYTES) {
+      const middle = low + Math.floor((high - low) / 2);
+      const probe = this.#probeEventSequence(descriptor, middle, high);
+      if (probe !== undefined && probe.sequence <= after) low = probe.lineEnd;
+      else high = middle;
+    }
+    return low;
+  }
+
+  /**
+   * Returns the first decodable event line that starts at or after `position`
+   * and ends before `end`, with the offset just past its newline. Reads begin
+   * with a small window and grow only while a line stays unterminated, capped
+   * so one probe never reads more than a boundary search plus one event.
+   */
+  #probeEventSequence(
+    descriptor: number,
+    position: number,
+    end: number,
+  ): { lineEnd: number; sequence: number } | undefined {
+    const cap = Math.min(end - position, 2 * (this.maxEventBytes + 1) + EVENT_SEEK_PROBE_BYTES);
+    if (cap <= 0) return undefined;
+    let buffer = Buffer.allocUnsafe(Math.min(cap, EVENT_SEEK_PROBE_BYTES));
+    let loaded = 0;
+    const load = (): boolean => {
+      if (loaded >= cap) return false;
+      if (loaded >= buffer.length) {
+        const grown = Buffer.allocUnsafe(Math.min(cap, buffer.length * 2));
+        buffer.copy(grown, 0, 0, loaded);
+        buffer = grown;
+      }
+      const bytesRead = fs.readSync(descriptor, buffer, loaded, buffer.length - loaded, position + loaded);
+      if (bytesRead <= 0) return false;
+      loaded += bytesRead;
+      return true;
+    };
+    let lineStart = position === 0 ? 0 : -1;
+    let cursor = 0;
+    for (;;) {
+      const view = buffer.subarray(0, loaded);
+      if (lineStart < 0) {
+        const boundary = view.indexOf(0x0a, cursor);
+        if (boundary < 0) {
+          cursor = loaded;
+          if (!load()) return undefined;
+          continue;
+        }
+        lineStart = boundary + 1;
+        cursor = lineStart;
+      }
+      const newline = view.indexOf(0x0a, cursor);
+      if (newline < 0) {
+        cursor = loaded;
+        if (!load()) return undefined;
+        continue;
+      }
+      const length = newline - lineStart;
+      if (length > 0 && length <= this.maxEventBytes) {
+        const decoded = view.subarray(lineStart, newline).toString("utf8");
+        const line = decoded.endsWith(String.fromCharCode(13)) ? decoded.slice(0, -1) : decoded;
+        try {
+          const event = JSON.parse(line) as { sequence?: unknown };
+          if (typeof event.sequence === "number") {
+            return { lineEnd: position + newline + 1, sequence: event.sequence };
+          }
+        } catch { /* skip malformed mesh log line */ }
+      }
+      lineStart = newline + 1;
+      cursor = lineStart;
     }
   }
 
@@ -1121,7 +1219,7 @@ export class MeshStore {
         fs.renameSync(temporaryPath, this.#eventsPath);
         if (this.durable) fsyncDirectory(this.root);
       } finally {
-        try { fs.rmSync(temporaryPath, { force: true }); } catch {}
+        try { fs.rmSync(temporaryPath, { force: true }); } catch { /* best-effort cleanup of the temporary */ }
       }
       atomicWrite(this.#generationPath, this.#readGeneration() + 1, Number.POSITIVE_INFINITY, this.durable);
     } catch (error) {
