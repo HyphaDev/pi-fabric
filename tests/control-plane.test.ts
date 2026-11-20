@@ -538,4 +538,90 @@ describe("FabricControlPlane", () => {
       sender.request("host:receiver", "agent:missing", "stop"),
     ).rejects.toThrow("target already settled");
   });
+
+  // A busy owner drains its control log serially and records each outcome with
+  // a contended CAS write. The requester must learn of a queued message as soon
+  // as the owner accepts it, and a slow owner must never read as a failure.
+  describe("delivery acknowledgement", () => {
+    const setupPair = (senderTimeoutMs: number) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+      roots.push(root);
+      const meshRoot = path.join(root, "mesh");
+      const sender = plane(meshRoot, "host:sender", {}, { acknowledgementTimeoutMs: senderTimeoutMs });
+      const receiver = plane(meshRoot, "host:receiver");
+      sender.start(() => ({ accepted: false }));
+      const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      return { sender, receiver, store };
+    };
+
+    it("acknowledges a queued message before recording its outcome", async () => {
+      const { sender, receiver } = setupPair(1_000);
+      const put = MeshStore.prototype.put.bind(receiver.mesh);
+      vi.spyOn(receiver.mesh, "put").mockImplementation(async (input) => {
+        // The outcome write follows the claim (ifVersion 0) on the same key.
+        if (input.key.startsWith("topology/control-seen/") && input.ifVersion !== 0) {
+          await new Promise((resolve) => setTimeout(resolve, 2_500));
+        }
+        return put(input);
+      });
+      const receive = vi.fn((command: { commandId: string }) => ({
+        accepted: true, messageId: "queued:" + command.commandId,
+      }));
+      receiver.start(receive);
+
+      await expect(
+        sender.request("host:receiver", "agent:target", "followUp", { message: "done" }),
+      ).resolves.toMatchObject({ acknowledged: true, messageId: expect.stringMatching(/^queued:/) });
+      expect(receive).toHaveBeenCalledTimes(1);
+    });
+
+    it("reports a slow owner as unconfirmed and still delivers without a cancel", async () => {
+      const { sender, receiver, store } = setupPair(200);
+      const receive = vi.fn(() => ({ accepted: true, messageId: "late" }));
+
+      // The owner is busy: it does not drain the command within the timeout.
+      await expect(
+        sender.request("host:receiver", "agent:target", "steer", { message: "focus" }),
+      ).rejects.toThrow(
+        "Delivery unconfirmed: agent:target did not acknowledge within 200ms; the message may still arrive",
+      );
+      expect(store.read({ topic: "fabric.control.command", after: 0 })
+        .filter((event) => event.kind === "cancel")).toEqual([]);
+
+      receiver.start(receive);
+      await vi.waitFor(() => expect(receive).toHaveBeenCalledWith(
+        expect.objectContaining({ operation: "steer", message: "focus" }),
+        expect.anything(),
+        expect.any(AbortSignal),
+      ), { timeout: 5_000 });
+    });
+
+    it("confirms a recorded delivery whose acknowledgement was lost", async () => {
+      const { sender, receiver } = setupPair(500);
+      const publish = MeshStore.prototype.publish.bind(receiver.mesh);
+      vi.spyOn(receiver.mesh, "publish").mockImplementation(async (input) => {
+        if (input.topic === "fabric.control.ack") return undefined as never;
+        return publish(input);
+      });
+      receiver.start((command) => ({ accepted: true, messageId: "queued:" + command.commandId }));
+
+      await expect(
+        sender.request("host:receiver", "agent:target", "followUp", { message: "done" }),
+      ).resolves.toMatchObject({ acknowledged: true, messageId: expect.stringMatching(/^queued:/) });
+    });
+
+    it("reports a recorded refusal whose acknowledgement was lost", async () => {
+      const { sender, receiver } = setupPair(500);
+      const publish = MeshStore.prototype.publish.bind(receiver.mesh);
+      vi.spyOn(receiver.mesh, "publish").mockImplementation(async (input) => {
+        if (input.topic === "fabric.control.ack") return undefined as never;
+        return publish(input);
+      });
+      receiver.start(() => ({ accepted: false, error: "target already settled" }));
+
+      await expect(
+        sender.request("host:receiver", "agent:missing", "stop"),
+      ).rejects.toThrow("target already settled");
+    });
+  });
 });

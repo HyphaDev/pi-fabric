@@ -9,6 +9,9 @@ const CONTROL_SEEN_PREFIX = "topology/control-seen/";
 const DEFAULT_POLL_MS = 100;
 const DEFAULT_ACK_TIMEOUT_MS = 5_000;
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
+// A queued message stays deliverable this long after the requester stops
+// waiting for its acknowledgement, so a busy owner can still accept it.
+const DELIVERY_WINDOW_MS = 60_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 const MAX_INCARNATION_LENGTH = 128;
 export const STALE_INCARNATION_ERROR =
@@ -148,6 +151,11 @@ export interface FabricControlRequestOptions {
   signal?: AbortSignal;
 }
 
+interface AcceptanceRequestOptions extends FabricControlRequestOptions {
+  /** Queue operations: a timeout reports delivery as unconfirmed, never cancels. */
+  delivery?: boolean;
+}
+
 interface PendingControlRequest {
   resolve: (acceptance: FabricControlAcceptance) => void;
   reject: (error: Error) => void;
@@ -219,7 +227,7 @@ export class FabricControlPlane {
       operation,
       input,
       ownerIdentityId,
-      { timeoutMs: this.#ackTimeoutMs },
+      { timeoutMs: this.#ackTimeoutMs, delivery: operation !== "ask" },
     );
     return {
       queued: true,
@@ -257,7 +265,7 @@ export class FabricControlPlane {
     operation: FabricControlOperation,
     input: FabricControlInput,
     ownerIdentityId: string,
-    options: FabricControlRequestOptions,
+    options: AcceptanceRequestOptions,
   ): Promise<{ commandId: string; acceptance: FabricControlAcceptance }> {
     if (!this.options.enabled) {
       throw new Error("Fabric mesh is disabled; cannot control a remote participant");
@@ -277,6 +285,17 @@ export class FabricControlPlane {
     const acceptance = new Promise<FabricControlAcceptance>((resolve, reject) => {
       const timer = setTimeout(() => {
         const timedOut = this.#clearPending(commandId);
+        if (options.delivery) {
+          // The owner may have accepted the message and lost or delayed its
+          // acknowledgement. Read its durable record; never cancel delivery.
+          if (!timedOut) return;
+          const recorded = this.#recordedAcceptance(timedOut, commandId);
+          if (recorded) resolve(recorded);
+          else reject(new Error(
+            `Delivery unconfirmed: ${targetId} did not acknowledge within ${timeoutMs}ms; the message may still arrive`,
+          ));
+          return;
+        }
         if (timedOut) void this.#publishCancellation(commandId, timedOut);
         reject(new Error("Timed out waiting for the remote Fabric owner to acknowledge " + targetId));
       }, timeoutMs);
@@ -330,8 +349,13 @@ export class FabricControlPlane {
             ? { ownerIncarnation: input.ownerIncarnation }
             : {}),
           requestedAt,
-          deadlineAt: requestedAt + timeoutMs,
+          deadlineAt: requestedAt + (options.delivery ? Math.max(timeoutMs, DELIVERY_WINDOW_MS) : timeoutMs),
         } satisfies FabricControlCommand,
+      }).catch((error: unknown) => {
+        if (!options.delivery) throw error;
+        // The mesh appends nothing when its lock or validation fails.
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(`Delivery failed: the message to ${targetId} was not sent: ${reason}`);
       });
       pendingRequest!.commandPublished = true;
       if (pendingRequest!.cancellationRequested) {
@@ -346,6 +370,33 @@ export class FabricControlPlane {
       const cancelled = this.#clearPending(commandId);
       if (cancelled) void this.#publishCancellation(commandId, cancelled);
       throw error;
+    }
+  }
+
+  /** The owner's durable outcome for a command, read without the mesh lock. */
+  #recordedAcceptance(
+    pending: PendingControlRequest,
+    commandId: string,
+  ): FabricControlAcceptance | undefined {
+    try {
+      const entry = this.mesh.get(controlSeenKey(pending.ownerHostId, commandId));
+      const record = controlSeenRecord(entry?.value);
+      if (
+        !entry ||
+        !record?.acceptance ||
+        entry.updatedBy.id !== pending.ownerIdentityId ||
+        record.hostId !== pending.ownerHostId ||
+        record.commandId !== commandId ||
+        record.targetId !== pending.targetId ||
+        (pending.ownerIncarnation !== undefined &&
+          record.ownerIncarnation !== undefined &&
+          record.ownerIncarnation !== pending.ownerIncarnation)
+      ) {
+        return undefined;
+      }
+      return record.acceptance;
+    } catch {
+      return undefined;
     }
   }
 
@@ -432,6 +483,9 @@ export class FabricControlPlane {
       }
       if (tail.events.length < 100) break;
     }
+    // Pruning expired claims scans the log; it runs after this batch so it
+    // never delays an acknowledgement.
+    await this.#cleanupSeen(Date.now());
   }
 
   #acceptAcknowledgement(event: MeshEvent): void {
@@ -475,7 +529,6 @@ export class FabricControlPlane {
       return;
     }
     const now = Date.now();
-    await this.#cleanupSeen(now);
     const deadlineAt = Math.min(
       command.deadlineAt ?? command.requestedAt + this.#ackTimeoutMs,
       command.requestedAt + MAX_CONTROL_TIMEOUT_MS,
@@ -612,6 +665,11 @@ export class FabricControlPlane {
         };
       }
       acceptance = this.#boundedAcceptance(acceptance);
+      // A queued message is acknowledged as soon as the handler accepts it.
+      // Recording the outcome is a contended CAS write; it keeps duplicates
+      // and lost acknowledgements answerable but must not delay receipt.
+      const early = command.operation !== "ask";
+      if (early) await this.#publishAcknowledgement(command, acceptance);
       try {
         await this.mesh.put({
           key,
@@ -630,7 +688,7 @@ export class FabricControlPlane {
       } catch {
         return;
       }
-      await this.#publishAcknowledgement(command, acceptance);
+      if (!early) await this.#publishAcknowledgement(command, acceptance);
     } finally {
       clearTimeout(deadlineTimer);
       const active = this.#activeCommands.get(command.commandId);
