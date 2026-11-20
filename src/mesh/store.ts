@@ -131,7 +131,9 @@ const STALE_LOCK_MS = 30_000;
 const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
-const DEFAULT_MAX_STATE_TOMBSTONES = 10_000;
+// The persisted high-water clock keeps evicted keys from reusing a revision,
+// so tombstones only need to cover recent deletes. Every reader parses them.
+const DEFAULT_MAX_STATE_TOMBSTONES = 1_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
 /** Initial window of one seek probe; grows (doubling) only while a line stays unterminated. */

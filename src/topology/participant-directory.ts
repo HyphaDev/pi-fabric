@@ -24,8 +24,10 @@ const MAX_HELD_LABEL_SKIPS = 64;
 const HOST_PREFIX = "topology/hosts/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
-const PARTICIPANT_HEARTBEAT_MS = 5_000;
-const PARTICIPANT_LEASE_MS = 15_000;
+// Each renewal rewrites the shared mesh state that every peer re-reads, so
+// the heartbeat sets fleet-wide parse load.
+const PARTICIPANT_HEARTBEAT_MS = 10_000;
+const PARTICIPANT_LEASE_MS = 30_000;
 /**
  * Stopped-root tombstones live under their own prefix, so live discovery
  * (list, get, sessions, peers, label checks) never scans them.
