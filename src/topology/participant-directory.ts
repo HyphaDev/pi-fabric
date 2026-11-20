@@ -818,6 +818,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
           return actor ? [[actor.id, actor.ownerIdentityId] as const] : [];
         }),
     );
+    // A record write that fails, for example on mesh lock contention, must not
+    // also skip the lease below: peers would read this live host as stale.
+    let recordError: unknown;
     for (const record of desired.values()) {
       const current = existingById.get(record.id);
       // Liveness comes from the host lease written below, so a renew does not
@@ -851,6 +854,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
         const latestParticipant = latest && participantFromEntry(latest);
         if (latestParticipant && latestParticipant.ownerHostId !== this.options.hostId) return;
         throw error;
+      }).catch((error: unknown) => {
+        recordError ??= error;
       });
     }
     for (const { entry, participant } of existing) {
@@ -858,7 +863,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       await this.mesh.delete({ key: entry.key, ifVersion: entry.version }).catch(() => undefined);
     }
 
-    if (!renew) return;
+    if (!renew) {
+      if (recordError !== undefined) throw recordError;
+      return;
+    }
     // Stamp this host's lease last, once every slower write above is done: a
     // refresh that outruns its own lease must not publish an already-expired
     // lease, which would make peers — and this host's own list() — read the
@@ -879,6 +887,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       identity: this.options.identity,
     });
     this.#renewedAt = leaseAt;
+    if (recordError !== undefined) throw recordError;
 
     // The sweep runs beside the heartbeat instead of holding it up. A batch
     // that leaves work behind brings the next sweep forward to the next beat.

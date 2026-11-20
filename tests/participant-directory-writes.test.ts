@@ -111,6 +111,24 @@ describe("ParticipantDirectory writes", () => {
     expect(keys().has("topology/hosts/*")).toBe(true);
   });
 
+  // A participant write that loses the mesh lock must not also skip the lease:
+  // peers would then read this live session as stale and fail to route to it.
+  it("renews the lease when a participant write fails", async () => {
+    const { mesh, state, directory, puts, only } = setup(60_000);
+    await directory.refresh();
+    const before = only("topology/hosts/").version;
+    const put = MeshStore.prototype.put.bind(mesh);
+    puts.mockImplementation(async (input) => {
+      if (input.key.startsWith("topology/participants/")) {
+        throw new Error("Timed out waiting for the Fabric mesh lock");
+      }
+      return put(input);
+    });
+    state.status = "running";
+    await expect(directory.refresh()).rejects.toThrow("Timed out waiting for the Fabric mesh lock");
+    expect(only("topology/hosts/").version).toBeGreaterThan(before);
+  });
+
   it("lists legacy actor states only under live legacy roots", async () => {
     const { mesh, directory } = setup(60_000);
     await mesh.put({ key: "actors/other-session/actor-1", value: { id: "actor-1", name: "a", runner: "pi", status: "idle" }, identity });
