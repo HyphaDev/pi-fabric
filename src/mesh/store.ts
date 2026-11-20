@@ -40,6 +40,8 @@ export interface MeshEvent {
   scheduled?: { dueAt: number; key?: string };
   /** Host-stamped authority of the publishing process; absent from older builds and grant posts. */
   sender?: FabricMessageSender;
+  /** Wake policy of a relayed steer or follow-up; absent from older builds and grant posts. */
+  triggerTurn?: boolean;
 }
 
 /**
@@ -69,6 +71,7 @@ export interface MeshAppendInput {
   grantId?: string;
   scheduled?: { dueAt: number; key?: string };
   sender?: FabricMessageSender;
+  triggerTurn?: boolean;
   /** A tighter per-event byte ceiling than the store's own. */
   maxEventBytes?: number;
 }
@@ -428,6 +431,8 @@ export class MeshStore {
     data?: unknown;
     /** Host-only: publish on behalf of another authority (an actor's scope). */
     sender?: FabricMessageSender;
+    /** Wake policy of a relayed steer or follow-up. */
+    triggerTurn?: boolean;
   }): Promise<MeshEvent> {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
@@ -483,6 +488,7 @@ export class MeshStore {
       ...(input.grantId ? { grantId: input.grantId } : {}),
       ...(input.scheduled ? { scheduled: { ...input.scheduled } } : {}),
       ...(input.sender ? { sender: jsonClone(input.sender) } : {}),
+      ...(typeof input.triggerTurn === "boolean" ? { triggerTurn: input.triggerTurn } : {}),
     };
     const line = JSON.stringify(event);
     const limit = Math.min(this.maxEventBytes, input.maxEventBytes ?? this.maxEventBytes);

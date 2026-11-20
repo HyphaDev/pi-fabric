@@ -2682,7 +2682,8 @@ describe("ActorManager steering relay", () => {
     await agentsA.stop(handle.id);
   });
 
-  it("relays a cross-process follow-up to the owning Main session", async () => {
+  // An absent triggerTurn is an older writer's payload: Main keeps its default.
+  it.each([undefined, true, false])("relays a cross-process follow-up to the owning Main session (triggerTurn %s)", async (triggerTurn) => {
     const shared = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-main-relay-"));
     roots.push(shared);
     const meshPath = path.join(shared, "mesh");
@@ -2743,13 +2744,25 @@ describe("ActorManager steering relay", () => {
     );
     actorManagers.push(rootActors, peerActors);
 
-    await peerActors.steerRemote(
-      "session:root",
-      "summarize after implementation",
-      "followUp",
-      { requestedBy: "peer" },
-    );
+    if (triggerTurn === undefined) {
+      await peerActors.steerRemote(
+        "session:root",
+        "summarize after implementation",
+        "followUp",
+        { requestedBy: "peer" },
+      );
+    } else {
+      await peerActors.steerRemote(
+        "session:root",
+        "summarize after implementation",
+        "followUp",
+        { requestedBy: "peer" },
+        { triggerTurn },
+      );
+    }
     await waitFor(() => deliveries.length === 1, 3_000);
+    expect(deliveries[0]?.triggerTurn).toBe(triggerTurn);
+    expect(Object.hasOwn(deliveries[0]!, "triggerTurn")).toBe(triggerTurn !== undefined);
     expect(deliveries).toMatchObject([
       {
         from: { id: "agent:peer", kind: "agent" },

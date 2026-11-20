@@ -717,6 +717,7 @@ export class ActorManager {
     message: string,
     kind: "steer" | "followUp",
     data?: unknown,
+    options: { triggerTurn?: boolean } = {},
   ): Promise<{ queued: true; messageId: string; routed: "mesh" }> {
     if (!this.meshConfig.enabled) {
       throw new Error("Fabric mesh is disabled; cannot steer a remote agent");
@@ -729,6 +730,8 @@ export class ActorManager {
       to: targetId,
       text: message,
       ...(data === undefined ? {} : { data }),
+      // Older receivers ignore this field and apply their default wake policy.
+      ...(typeof options.triggerTurn === "boolean" ? { triggerTurn: options.triggerTurn } : {}),
     });
     return { queued: true, messageId: event.id, routed: "mesh" };
   }
@@ -1710,6 +1713,7 @@ export class ActorManager {
             from: event.from,
             message,
             delivery: kind,
+            ...(typeof event.triggerTurn === "boolean" ? { triggerTurn: event.triggerTurn } : {}),
             ...(event.data === undefined ? {} : { data: event.data }),
           });
         } catch {

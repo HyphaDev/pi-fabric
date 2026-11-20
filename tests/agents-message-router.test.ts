@@ -151,4 +151,20 @@ describe("routing to a live root whose lease lapsed", () => {
     expect(actors.steerRemote).toHaveBeenCalledWith("session:peer", "hello", "followUp", undefined);
     expect(request).not.toHaveBeenCalled();
   });
+
+  it.each([true, false])("keeps triggerTurn %s on the legacy relay to a peer root", async (triggerTurn) => {
+    const { router, request, actors } = setup(root({ ...peer, controlProtocol: "legacy" }));
+    vi.mocked(actors.steerRemote).mockResolvedValue({ queued: true, messageId: "relayed", routed: "mesh" });
+    await router.routeMessage("session:peer", "hello", { n: 1 }, "steer", undefined, { triggerTurn });
+    expect(actors.steerRemote).toHaveBeenCalledWith("session:peer", "hello", "steer", { n: 1 }, { triggerTurn });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])("keeps triggerTurn %s on the legacy relay to a remote Main", async (triggerTurn) => {
+    const { router, request, actors } = setup(root({ controlProtocol: "legacy" }));
+    vi.mocked(actors.steerRemote).mockResolvedValue({ queued: true, messageId: "relayed", routed: "mesh" });
+    await router.routeMessage("main", "done", undefined, "followUp", undefined, { triggerTurn });
+    expect(actors.steerRemote).toHaveBeenCalledWith("session:main", "done", "followUp", undefined, { triggerTurn });
+    expect(request).not.toHaveBeenCalled();
+  });
 });
