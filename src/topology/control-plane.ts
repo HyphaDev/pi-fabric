@@ -1,6 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { FabricActorRunBinding } from "../actors/types.js";
-import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
+import {
+  MeshAppendUnconfirmedError,
+  MeshStore,
+  type MeshEvent,
+  type MeshIdentity,
+} from "../mesh/store.js";
 import type { FabricMessageSender } from "../protocol.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
@@ -353,8 +358,13 @@ export class FabricControlPlane {
         } satisfies FabricControlCommand,
       }).catch((error: unknown) => {
         if (!options.delivery) throw error;
-        // The mesh appends nothing when its lock or validation fails.
         const reason = error instanceof Error ? error.message : String(error);
+        // A failure after the event line was written can leave a readable,
+        // deliverable command; the owner may still run it.
+        if (error instanceof MeshAppendUnconfirmedError) {
+          throw new Error(`Delivery unconfirmed: the message to ${targetId} may have been sent: ${reason}`);
+        }
+        // Lock, validation and size failures append nothing.
         throw new Error(`Delivery failed: the message to ${targetId} was not sent: ${reason}`);
       });
       pendingRequest!.commandPublished = true;

@@ -551,8 +551,43 @@ describe("FabricControlPlane", () => {
       const receiver = plane(meshRoot, "host:receiver");
       sender.start(() => ({ accepted: false }));
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
-      return { sender, receiver, store };
+      return { sender, receiver, store, meshRoot };
     };
+
+    it("reports a command appended before its publish failed as unconfirmed and still delivers it", async () => {
+      const { sender, receiver, store, meshRoot } = setupPair(1_000);
+      // The sequence counter write fails after the event line is appended:
+      // its path is a non-empty directory the atomic rename cannot replace.
+      const counter = path.join(meshRoot, "sequence");
+      fs.rmSync(counter, { recursive: true, force: true });
+      fs.mkdirSync(path.join(counter, "blocker"), { recursive: true });
+
+      await expect(
+        sender.request("host:receiver", "agent:target", "followUp", { message: "appended" }),
+      ).rejects.toThrow(/^Delivery unconfirmed: the message to agent:target may have been sent: /);
+      const commands = store.read({ topic: "fabric.control.command", after: 0 });
+      expect(commands.filter((event) => event.kind === "cancel")).toEqual([]);
+      expect(commands.map((event) => event.data)).toContainEqual(
+        expect.objectContaining({ operation: "followUp", message: "appended" }),
+      );
+
+      fs.rmSync(counter, { recursive: true, force: true });
+      const receive = vi.fn(() => ({ accepted: true, messageId: "late" }));
+      receiver.start(receive);
+      await vi.waitFor(() => expect(receive).toHaveBeenCalledWith(
+        expect.objectContaining({ operation: "followUp", message: "appended" }),
+        expect.anything(),
+        expect.any(AbortSignal),
+      ), { timeout: 5_000 });
+    });
+
+    it("reports a command refused before any append as not sent", async () => {
+      const { sender, store } = setupPair(1_000);
+      await expect(
+        sender.request("host:receiver", "agent:target", "steer", { message: "x".repeat(70 * 1024) }),
+      ).rejects.toThrow(/^Delivery failed: the message to agent:target was not sent: Mesh event exceeds/);
+      expect(store.read({ topic: "fabric.control.command", after: 0 })).toEqual([]);
+    });
 
     it("acknowledges a queued message before recording its outcome", async () => {
       const { sender, receiver } = setupPair(1_000);
