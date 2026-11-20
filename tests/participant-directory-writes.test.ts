@@ -95,7 +95,9 @@ describe("ParticipantDirectory writes", () => {
     now += 1;
     directory.scheduleRefresh();
     await settle();
-    expect([...keys()]).toEqual(expect.arrayContaining(["sessions/*", "topology/hosts/*", "topology/participants/*"]));
+    expect([...keys()]).toEqual(expect.arrayContaining(["sessions/*", "topology/hosts/*"]));
+    // An unchanged participant is not rewritten; the host lease carries liveness.
+    expect(keys().has("topology/participants/*")).toBe(false);
     expect((only("topology/hosts/").value as { expiresAt: number }).expiresAt).toBe(before + 1_000);
   });
 

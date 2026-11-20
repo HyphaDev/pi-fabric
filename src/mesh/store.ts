@@ -269,7 +269,7 @@ const atomicWrite = (
   maxBytes = Number.POSITIVE_INFINITY,
   fsync = false,
 ): void => {
-  const serialized = JSON.stringify(value, null, 2);
+  const serialized = JSON.stringify(value);
   if (Buffer.byteLength(serialized, "utf8") > maxBytes) {
     throw new Error(`Fabric mesh state exceeds ${maxBytes} bytes`);
   }
