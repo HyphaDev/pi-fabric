@@ -144,19 +144,21 @@ describe("agents provider message routing service boundaries", () => {
     expect(actors.steerRemote).not.toHaveBeenCalled();
   });
 
-  it("rejects a remote root when capability or v1 control is absent", async () => {
+  it("rejects a remote root without the capability and relays one without v1 control", async () => {
     const { router, participants, control, actors, agents, main } = routing();
     const remote: FabricParticipantInfo = { ...participant(), id: "session:peer", rootId: "session:peer", capabilities: [] };
     participants.get.mockReturnValue(remote);
     await expect(router.routeMessage(remote.id, "hello", undefined, "steer")).rejects.toThrow("does not support steer");
     remote.capabilities = ["steer"];
     remote.controlProtocol = "legacy";
-    await expect(router.routeMessage(remote.id, "hello", undefined, "steer")).rejects.toThrow("has no control channel");
+    // A live root never reports a missing control channel: it takes the mesh relay.
+    await router.routeMessage(remote.id, "hello", undefined, "steer");
+    expect(actors.steerRemote).toHaveBeenLastCalledWith("session:peer", "hello", "steer", undefined);
     remote.controlProtocol = "v1";
     const withoutControl = new AgentMessageRouter(agents, actors, main, participants, undefined, (binding) => binding);
-    await expect(withoutControl.routeMessage(remote.id, "hello", undefined, "steer")).rejects.toThrow("has no control channel");
+    await withoutControl.routeMessage(remote.id, "again", undefined, "steer");
+    expect(actors.steerRemote).toHaveBeenLastCalledWith("session:peer", "again", "steer", undefined);
     expect(control.request).not.toHaveBeenCalled();
-    expect(actors.steerRemote).not.toHaveBeenCalled();
   });
 
   it("leaves local Main delivery and remote actor routing unchanged", async () => {
