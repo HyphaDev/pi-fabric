@@ -42,6 +42,19 @@ export interface MeshEvent {
   sender?: FabricMessageSender;
 }
 
+/**
+ * A publish that failed after its event line was written, or while writing it.
+ * The event may be in the log and readable by subscribers, so callers must not
+ * report it as unsent. Failures before the write (lock timeout, validation,
+ * size limit) throw the original error instead.
+ */
+export class MeshAppendUnconfirmedError extends Error {
+  constructor(readonly cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "MeshAppendUnconfirmedError";
+  }
+}
+
 /** Host-internal append request used inside {@link MeshStore.transact}. */
 export interface MeshAppendInput {
   id?: string;
@@ -420,13 +433,22 @@ export class MeshStore {
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
     const eventData = input.data === undefined ? undefined : jsonClone(input.data);
     const sender = input.sender ?? processSender();
-    return this.#withLock(() => {
-      // Any write that already holds the lock also releases due schedules first,
-      // so the log keeps due-time order relative to this event. Damaged
-      // schedule state must not block ordinary publishing.
-      try { this.#releaseDueLocked(Date.now()); } catch { /* schedule mutations report it */ }
-      return this.#appendLocked({ ...input, ...(eventData !== undefined ? { data: eventData } : {}), sender });
-    });
+    let writeStarted = false;
+    try {
+      return await this.#withLock(() => {
+        // Any write that already holds the lock also releases due schedules first,
+        // so the log keeps due-time order relative to this event. Damaged
+        // schedule state must not block ordinary publishing.
+        try { this.#releaseDueLocked(Date.now()); } catch { /* schedule mutations report it */ }
+        return this.#appendLocked(
+          { ...input, ...(eventData !== undefined ? { data: eventData } : {}), sender },
+          () => { writeStarted = true; },
+        );
+      });
+    } catch (error) {
+      if (writeStarted) throw new MeshAppendUnconfirmedError(error);
+      throw error;
+    }
   }
 
   /**
@@ -443,7 +465,7 @@ export class MeshStore {
     });
   }
 
-  #appendLocked(input: MeshAppendInput): MeshEvent {
+  #appendLocked(input: MeshAppendInput, onWrite?: () => void): MeshEvent {
     this.#repairEventLog();
     const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
     const event: MeshEvent = {
@@ -467,6 +489,7 @@ export class MeshStore {
     if (Buffer.byteLength(line, "utf8") > limit) {
       throw new Error(`Mesh event exceeds ${limit} bytes`);
     }
+    onWrite?.();
     this.#appendEventLine(`${line}\n`);
     atomicWrite(this.#counterPath, sequence, Number.POSITIVE_INFINITY, this.durable);
     this.#compactEventLog();
