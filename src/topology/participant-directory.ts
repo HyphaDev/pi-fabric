@@ -818,9 +818,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     );
     for (const record of desired.values()) {
       const current = existingById.get(record.id);
-      if (current && (renew
-        ? JSON.stringify(current.participant) === JSON.stringify(record)
-        : sameExceptUpdatedAt(current.participant, record))) continue;
+      // Liveness comes from the host lease written below, so a renew does not
+      // rewrite a participant whose only change is its updatedAt stamp.
+      if (current && sameExceptUpdatedAt(current.participant, record)) continue;
       const key = keyFor(PARTICIPANT_PREFIX, record.id);
       const occupied = current?.entry ?? this.mesh.get(key);
       const occupiedParticipant = occupied && participantFromEntry(occupied);
