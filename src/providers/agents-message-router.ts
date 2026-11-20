@@ -40,6 +40,19 @@ export class AgentMessageRouter {
    * its identity, so a child can address it even when no live record is
    * readable; the owner acknowledges or the request reports it unconfirmed.
    */
+  /** Legacy mesh relay; carries an explicit triggerTurn to receivers that read it. */
+  #relay(
+    id: string,
+    message: string,
+    kind: "steer" | "followUp",
+    data: unknown,
+    triggerTurn: boolean | undefined,
+  ): Promise<FabricAgentMessageResult> {
+    return typeof triggerTurn === "boolean"
+      ? this.actorManager.steerRemote(id, message, kind, data, { triggerTurn })
+      : this.actorManager.steerRemote(id, message, kind, data);
+  }
+
   #mainEndpoint(): FabricParticipantInfo {
     const id = this.mainAgent.id;
     const live = this.participants.get(id);
@@ -90,7 +103,7 @@ export class AgentMessageRouter {
         throw new Error(`Fabric participant ${participant.id} does not support ${kind}`);
       }
       if (!this.control || participant.controlProtocol === "legacy") {
-        return this.actorManager.steerRemote(this.mainAgent.id, message, kind, data);
+        return this.#relay(this.mainAgent.id, message, kind, data, options.triggerTurn);
       }
       this.#reportTarget(participant, context);
       return this.control.request(
@@ -136,7 +149,7 @@ export class AgentMessageRouter {
         ? this.#staleControlRecord(remote.id) ?? remote
         : remote;
       if (endpoint.kind === "root" && (!this.control || endpoint.controlProtocol !== "v1")) {
-        return this.actorManager.steerRemote(endpoint.id, message, kind, data);
+        return this.#relay(endpoint.id, message, kind, data, options.triggerTurn);
       }
       if (!this.control || endpoint.controlProtocol !== "v1") {
         throw new Error(`Fabric ${endpoint.kind} ${endpoint.id} has no control channel`);
@@ -202,7 +215,7 @@ export class AgentMessageRouter {
       if (needsBinding) {
         throw new Error(`Fabric actor owner ${participant.ownerHostId} has no binding control channel`);
       }
-      return this.actorManager.steerRemote(participant.id, message, kind, data);
+      return this.#relay(participant.id, message, kind, data, options.triggerTurn);
     }
     return this.control.request(
       participant.ownerHostId,
