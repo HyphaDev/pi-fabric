@@ -13,7 +13,8 @@ export class AgentMessageRouter {
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding">,
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent">,
-    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh">,
+    readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh"> &
+      Partial<Pick<FabricParticipantSource, "list">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
     readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext) => FabricActorRunBinding,
   ) {}
@@ -22,6 +23,36 @@ export class AgentMessageRouter {
     const name = participant.label || participant.name || participant.id;
     context?.activity?.({ type: "entity", id: participant.id, kind: "agent", name });
     context?.attachPreview?.({ kind: "fabric-agent-target", id: participant.id, name });
+  }
+
+  /**
+   * The newest canonical control record for `id`, even when its owner's lease
+   * lapsed. A busy host can miss renewals under mesh lock contention while its
+   * control plane keeps draining commands addressed to it.
+   */
+  #staleControlRecord(id: string): FabricParticipantInfo | undefined {
+    return this.participants.list?.({ scope: "project", includeStale: true })
+      .find((participant) => participant.id === id && participant.controlProtocol === "v1");
+  }
+
+  /**
+   * Main's control endpoint. A Main session hosts its own control plane under
+   * its identity, so a child can address it even when no live record is
+   * readable; the owner acknowledges or the request reports it unconfirmed.
+   */
+  #mainEndpoint(): FabricParticipantInfo {
+    const id = this.mainAgent.id;
+    const live = this.participants.get(id);
+    if (live?.controlProtocol === "v1") return live;
+    const stale = this.#staleControlRecord(id);
+    if (stale) return { ...stale, local: false };
+    if (live) return live;
+    return {
+      format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id,
+      name: "Main", status: "running", runner: "pi", transport: "host",
+      capabilities: ["steer", "followUp", "fabric"], startedAt: 0, updatedAt: 0,
+      controlProtocol: "v1", local: false, stale: true,
+    };
   }
 
   async routeMessage(
@@ -54,8 +85,7 @@ export class AgentMessageRouter {
           ...(data === undefined ? {} : { data }),
         });
       }
-      const participant = this.participants.get(this.mainAgent.id);
-      if (!participant) throw new Error(`Unknown Fabric Main participant: ${this.mainAgent.id}`);
+      const participant = this.#mainEndpoint();
       if (!participant.capabilities.includes(kind)) {
         throw new Error(`Fabric participant ${participant.id} does not support ${kind}`);
       }
@@ -100,13 +130,21 @@ export class AgentMessageRouter {
       if (!remote.capabilities.includes(kind)) {
         throw new Error(`Fabric participant ${remote.id} does not support ${kind}`);
       }
-      if (!this.control || remote.controlProtocol !== "v1") {
-        throw new Error(`Fabric ${remote.kind} ${remote.id} has no control channel`);
+      // A root read through its session record alone still drains control when
+      // its canonical record only lapsed; a true legacy root takes the relay.
+      const endpoint = remote.kind === "root" && remote.controlProtocol !== "v1"
+        ? this.#staleControlRecord(remote.id) ?? remote
+        : remote;
+      if (endpoint.kind === "root" && (!this.control || endpoint.controlProtocol !== "v1")) {
+        return this.actorManager.steerRemote(endpoint.id, message, kind, data);
       }
-      this.#reportTarget(remote, context);
+      if (!this.control || endpoint.controlProtocol !== "v1") {
+        throw new Error(`Fabric ${endpoint.kind} ${endpoint.id} has no control channel`);
+      }
+      this.#reportTarget(endpoint, context);
       return this.control.request(
-        remote.ownerHostId,
-        remote.id,
+        endpoint.ownerHostId,
+        endpoint.id,
         kind,
         {
           message,
@@ -114,9 +152,9 @@ export class AgentMessageRouter {
           ...(typeof options.triggerTurn === "boolean"
             ? { triggerTurn: options.triggerTurn }
             : {}),
-          ...(remote.ownerIncarnation ? { ownerIncarnation: remote.ownerIncarnation } : {}),
+          ...(endpoint.ownerIncarnation ? { ownerIncarnation: endpoint.ownerIncarnation } : {}),
         },
-        remote.ownerIdentityId,
+        endpoint.ownerIdentityId,
       );
     }
 

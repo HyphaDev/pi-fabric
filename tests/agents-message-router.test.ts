@@ -12,7 +12,11 @@ const remoteAgent = (overrides: Partial<FabricParticipantInfo> = {}): FabricPart
   capabilities: ["steer", "followUp", "stop"], startedAt: 1, updatedAt: 2,
   controlProtocol: "v1", local: false, stale: false, ...overrides,
 });
-const setup = (participant: FabricParticipantInfo, withControl = true) => {
+const setup = (
+  participant: FabricParticipantInfo | undefined,
+  withControl = true,
+  stale: FabricParticipantInfo[] = [],
+) => {
   const manager: Ports[0] = {
     status: vi.fn(() => { throw new Error("Unknown Fabric agent"); }),
     steer: vi.fn(), followUp: vi.fn(), stop: vi.fn(),
@@ -28,7 +32,8 @@ const setup = (participant: FabricParticipantInfo, withControl = true) => {
     matches: (id) => id === "main" || id === "session:main", deliverAgent: vi.fn(),
   };
   const participants: Ports[3] = {
-    get: (id) => id === participant.id ? participant : undefined,
+    get: (id) => id === participant?.id ? participant : undefined,
+    list: vi.fn((options) => options?.includeStale ? stale : []),
     scheduleRefresh: vi.fn(),
   };
   const request = vi.fn<NonNullable<Ports[4]>["request"]>().mockResolvedValue({
@@ -96,6 +101,54 @@ describe("remote one-shot agent routing", () => {
     const { router, request } = setup(participant);
     await expect(router.routeMessage(participant.id, "hello", undefined, "steer"))
       .rejects.toThrow("Unknown Fabric participant");
+    expect(request).not.toHaveBeenCalled();
+  });
+});
+
+// A busy host can miss lease renewals under mesh lock contention. Its canonical
+// record then reads stale while the session is alive and still drains control.
+describe("routing to a live root whose lease lapsed", () => {
+  const root = (overrides: Partial<FabricParticipantInfo> = {}): FabricParticipantInfo => remoteAgent({
+    id: "session:main", kind: "root", rootId: "session:main", ownerHostId: "session:main",
+    ownerIdentityId: "session:main", ownerIncarnation: "main-generation", name: "main", transport: "host",
+    capabilities: ["steer", "followUp", "fabric"], ...overrides,
+  });
+  const peer = {
+    id: "session:peer", rootId: "session:peer", ownerHostId: "session:peer", ownerIdentityId: "session:peer",
+  };
+
+  it("delivers a child's followUp to its Main through the stale canonical record", async () => {
+    const { router, request } = setup(undefined, true, [root({ stale: true })]);
+    await expect(router.routeMessage("main", "done", undefined, "followUp"))
+      .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+    expect(request).toHaveBeenCalledWith("session:main", "session:main", "followUp",
+      expect.objectContaining({ message: "done", ownerIncarnation: "main-generation" }), "session:main");
+  });
+
+  it("delivers a child's followUp to its Main by identity when no record is readable", async () => {
+    const { router, request } = setup(undefined);
+    await expect(router.routeMessage("main", "done", undefined, "followUp"))
+      .resolves.toMatchObject({ routed: "mesh" });
+    expect(request).toHaveBeenCalledWith("session:main", "session:main", "followUp",
+      expect.objectContaining({ message: "done" }), "session:main");
+  });
+
+  it("routes a peer root seen only through its session record over its stale control record", async () => {
+    const { ownerIncarnation: _incarnation, ...legacy } = root({ ...peer, controlProtocol: "legacy" });
+    const { router, request, actors } = setup(legacy, true, [root({ ...peer, stale: true })]);
+    await expect(router.routeMessage("session:peer", "hello", undefined, "steer"))
+      .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
+    expect(request).toHaveBeenCalledWith("session:peer", "session:peer", "steer",
+      expect.objectContaining({ message: "hello" }), "session:peer");
+    expect(actors.steerRemote).not.toHaveBeenCalled();
+  });
+
+  it("relays to a legacy peer root over the mesh steering topic", async () => {
+    const { router, request, actors } = setup(root({ ...peer, controlProtocol: "legacy" }));
+    vi.mocked(actors.steerRemote).mockResolvedValue({ queued: true, messageId: "relayed", routed: "mesh" });
+    await expect(router.routeMessage("session:peer", "hello", undefined, "followUp"))
+      .resolves.toMatchObject({ messageId: "relayed", routed: "mesh" });
+    expect(actors.steerRemote).toHaveBeenCalledWith("session:peer", "hello", "followUp", undefined);
     expect(request).not.toHaveBeenCalled();
   });
 });
