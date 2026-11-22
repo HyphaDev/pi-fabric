@@ -31,8 +31,11 @@ export class ActorMeshMonitor {
     },
   ) {
     const saved = this.#readCursor();
-    this.#offset = saved?.cursor ?? mesh.latestOffset();
+    // Read the sequence before the offset: an append between the two reads
+    // then lands past both, or past the offset only (skipped, as before), and
+    // is never filtered out as already delivered.
     this.#sequence = saved ? saved.sequence : mesh.latestSequence();
+    this.#offset = saved?.cursor ?? mesh.latestOffset();
   }
 
   start(): void {
