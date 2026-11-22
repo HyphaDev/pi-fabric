@@ -1,3 +1,5 @@
+import { MeshStore } from "../src/mesh/store.js";
+
 import fs, { type FSWatcher } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -24,7 +26,7 @@ function setup(cursor?: string) {
   const watcher = Object.assign(new EventEmitter(), { close: vi.fn() });
   vi.spyOn(fs, "watch").mockReturnValue(watcher as unknown as FSWatcher);
   const event = { topic: "test" } as MeshEvent;
-  const mesh = { root, latestOffset: vi.fn(() => 10), tail: vi.fn(() => ({ events: [event], nextOffset: 20 })) };
+  const mesh = { root, latestOffset: vi.fn(() => 10), latestSequence: vi.fn(() => 0), tail: vi.fn(() => ({ events: [event], nextOffset: 20 })) };
   const beforePoll = vi.fn(() => true);
   const onEvent = vi.fn();
   const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 7 }, { cursorPath, beforePoll, onEvent });
@@ -34,6 +36,34 @@ function setup(cursor?: string) {
 
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 
+it("resumes a persisted actor cursor after compaction without redelivery", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-generation-"));
+  roots.push(root);
+  const mesh = new MeshStore(root, 1024, 100, { maxEventLogBytes: 6000, retainedEventLogBytes: 4000 });
+  const publish = () => mesh.publish({ topic: "test", from: { id: "session:test", name: "test", kind: "main" }, text: "x".repeat(300) });
+  for (let i = 0; i < 6; i++) await publish();
+  const cursorPath = path.join(root, "cursor.json");
+  const config = { enabled: true, actorPollMs: 2000, maxReadEvents: 100 };
+  const delivered: number[] = [];
+  const callbacks = { cursorPath, beforePoll: () => true, onEvent: (event: MeshEvent) => { delivered.push(event.sequence); } };
+  const first = new ActorMeshMonitor(mesh, config, callbacks);
+  monitors.push(first);
+  first.schedule();
+  await flush();
+  first.close();
+  const sequence = mesh.latestSequence();
+  const generationPath = path.join(root, "generation");
+  while (!fs.existsSync(generationPath)) await publish();
+  const fresh = await publish();
+  const resumed = new ActorMeshMonitor(mesh, config, callbacks);
+  monitors.push(resumed);
+  resumed.schedule();
+  await flush();
+  expect(delivered).toEqual(Array.from({ length: fresh.sequence - sequence }, (_, i) => sequence + i + 1));
+  resumed.schedule();
+  await flush();
+  expect(delivered.filter((value) => value === fresh.sequence)).toHaveLength(1);
+});
 describe("ActorMeshMonitor", () => {
   it("coalesces notifications, preserves a halted cursor, and resumes in order", async () => {
     const s = setup('{"format":1,"cursor":3}');
@@ -92,7 +122,7 @@ describe("ActorMeshMonitor", () => {
     s.monitor.start();
     s.monitor.start();
     await flush();
-    expect(s.mesh.tail).toHaveBeenCalledExactlyOnceWith(10, 7);
+    expect(s.mesh.tail).toHaveBeenCalledExactlyOnceWith(10, 7, { afterSequence: 0 });
     await vi.advanceTimersByTimeAsync(50);
     expect(s.mesh.tail).toHaveBeenCalledTimes(2);
     expect(vi.getTimerCount()).toBe(1);

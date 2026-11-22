@@ -13,13 +13,14 @@ export class ActorMeshMonitor {
   #dueAt: number | undefined;
   #watcher: FSWatcher | undefined;
   #offset: number;
+  #sequence: number | undefined;
   #scheduled = false;
   #polling = false;
   #closed = false;
   #started = false;
 
   constructor(
-    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> &
+    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "latestSequence" | "tail"> &
       Partial<Pick<MeshStore, "nextScheduleDueAt" | "releaseDueSchedules">>,
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
@@ -29,7 +30,9 @@ export class ActorMeshMonitor {
       onEvent(event: MeshEvent): void;
     },
   ) {
-    this.#offset = this.#readCursor() ?? mesh.latestOffset();
+    const saved = this.#readCursor();
+    this.#offset = saved?.cursor ?? mesh.latestOffset();
+    this.#sequence = saved ? saved.sequence : mesh.latestSequence();
   }
 
   start(): void {
@@ -125,24 +128,35 @@ export class ActorMeshMonitor {
         try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
       }
       this.#armDue(dueAt);
-      const tail = this.mesh.tail(this.#offset, this.config.maxReadEvents);
+      const tail = this.#sequence === undefined
+        ? this.mesh.tail(this.#offset, this.config.maxReadEvents)
+        : this.mesh.tail(this.#offset, this.config.maxReadEvents, { afterSequence: this.#sequence });
       this.#offset = tail.nextOffset;
-      for (const event of tail.events) this.callbacks.onEvent(event);
+      for (const event of tail.events) {
+        this.callbacks.onEvent(event);
+        this.#sequence = event.sequence;
+      }
       this.#writeCursor();
     } finally {
       this.#polling = false;
     }
   }
 
-  #readCursor(): number | undefined {
+  #readCursor(): { cursor: number; sequence: number | undefined } | undefined {
     if (!this.callbacks.cursorPath) return undefined;
     try {
       const value = JSON.parse(fs.readFileSync(this.callbacks.cursorPath, "utf8")) as {
         format?: unknown;
         cursor?: unknown;
+        sequence?: unknown;
       };
       return value.format === 1 && typeof value.cursor === "number" && value.cursor >= 0
-        ? value.cursor
+        ? {
+            cursor: value.cursor,
+            sequence: typeof value.sequence === "number" && Number.isSafeInteger(value.sequence) && value.sequence >= 0
+              ? value.sequence
+              : undefined,
+          }
         : undefined;
     } catch {
       return undefined;
@@ -152,7 +166,7 @@ export class ActorMeshMonitor {
   #writeCursor(): void {
     if (!this.callbacks.cursorPath) return;
     try {
-      writeJsonAtomic(this.callbacks.cursorPath, { format: 1, cursor: this.#offset }, { space: 2 });
+      writeJsonAtomic(this.callbacks.cursorPath, { format: 1, cursor: this.#offset, sequence: this.#sequence }, { space: 2 });
     } catch {
       // Cursor persistence is best-effort; replay resumes from the latest safe cursor.
     }
