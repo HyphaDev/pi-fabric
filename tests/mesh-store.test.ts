@@ -60,6 +60,25 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("sequence-aware tail recovery", () => {
+  it.each([false, true])("resumes after compaction (mid-log: %s)", async (midLog) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tail-generation-"));
+    roots.push(root);
+    const store = new MeshStore(root, 1024, 100, { maxEventLogBytes: 6000, retainedEventLogBytes: 5500 });
+    const publish = () => store.publish({ topic: "test", from: identity, text: "x".repeat(300) });
+    for (let i = 0; i < 6; i++) await publish();
+    const page = store.tail(0, midLog ? 4 : 100);
+    const afterSequence = page.events.at(-1)!.sequence;
+    const expected = midLog ? [5, 6] : [];
+    const generation = fs.existsSync(path.join(root, "generation")) ? fs.readFileSync(path.join(root, "generation"), "utf8") : "";
+    while ((fs.existsSync(path.join(root, "generation")) ? fs.readFileSync(path.join(root, "generation"), "utf8") : "") === generation) {
+      expected.push((await publish()).sequence);
+    }
+    expected.push((await publish()).sequence);
+    expect(store.tail(page.nextOffset, 100, { afterSequence }).events.map((event) => event.sequence)).toEqual(expected);
+    expect(store.tail(page.nextOffset, 100).events.some((event) => event.sequence <= afterSequence)).toBe(true);
+  });
+});
 describe("MeshStore", () => {
   it("publishes durable ordered events and reads from a cursor", async () => {
     const store = createStore();

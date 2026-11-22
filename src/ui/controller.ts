@@ -65,6 +65,7 @@ export class FabricUiController {
   #snapshot: FabricDashboardSnapshot = emptySnapshot();
   #events: MeshEvent[] = [];
   #meshOffset = 0;
+  #meshSequence = 0;
   #timer: NodeJS.Timeout | undefined;
   #activityUnsubscribe: (() => void) | undefined;
   #actorUnsubscribe: (() => void) | undefined;
@@ -126,6 +127,7 @@ export class FabricUiController {
     if (this.state.config.mesh.enabled) {
       this.#events = this.state.mesh.read({ limit: this.state.config.ui.eventHistory });
       this.#meshOffset = this.state.mesh.latestOffset();
+      this.#meshSequence = this.#events.at(-1)?.sequence ?? 0;
     }
     this.#activityUnsubscribe = this.state.activity.subscribe(() => this.#scheduleRefresh());
     this.#actorUnsubscribe = this.state.actors.subscribe(() => this.#scheduleRefresh());
@@ -182,6 +184,7 @@ export class FabricUiController {
     this.#widgetMounted = false;
     this.#events = [];
     this.#meshOffset = 0;
+    this.#meshSequence = 0;
     this.#snapshot = emptySnapshot();
     this.#widgetRetention.clear();
     this.#widgetViewport.offset = 0;
@@ -913,9 +916,10 @@ export class FabricUiController {
 
   #pollMesh(): void {
     if (!this.state.config.mesh.enabled) return;
-    const result = this.state.mesh.tail(this.#meshOffset, this.state.config.ui.eventHistory);
+    const result = this.state.mesh.tail(this.#meshOffset, this.state.config.ui.eventHistory, { afterSequence: this.#meshSequence });
     this.#meshOffset = result.nextOffset;
     if (result.events.length === 0) return;
+    this.#meshSequence = result.events.at(-1)!.sequence;
     this.#events.push(...result.events);
     const limit = this.state.config.ui.eventHistory;
     if (this.#events.length > limit) this.#events.splice(0, this.#events.length - limit);

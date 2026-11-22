@@ -709,7 +709,10 @@ export class MeshStore {
     return this.#encodeCursor(generation, completeOffset);
   }
 
-  tail(cursor: number, limit = 100): MeshTailResult {
+  /** Resume by sequence when compaction invalidates the byte cursor; omit options for legacy replay. */
+  tail(cursor: number, limit = 100, options?: { afterSequence?: number }): MeshTailResult {
+    const candidate = options?.afterSequence;
+    const after = typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate >= 0 ? candidate : undefined;
     const boundedLimit = Math.max(1, Math.min(Math.floor(limit), this.maxReadEvents));
     const generation = this.#readGeneration();
     const decoded = this.#decodeCursor(cursor);
@@ -723,6 +726,7 @@ export class MeshStore {
         fs.readSync(descriptor, previousByte, 0, 1, position - 1);
         if (previousByte[0] !== 0x0a) position = 0;
       }
+      if (after !== undefined && position === 0) position = this.#seekEventsAfter(descriptor, size, after);
       if (position >= size) {
         return { events: [], nextOffset: this.#encodeCursor(generation, position) };
       }
@@ -743,7 +747,7 @@ export class MeshStore {
         if (line) {
           try {
             const event = JSON.parse(line) as MeshEvent;
-            if (typeof event.sequence === "number") events.push(event);
+            if (typeof event.sequence === "number" && (after === undefined || event.sequence > after)) events.push(event);
           } catch { /* skip malformed mesh log line */ }
         }
         if (events.length >= boundedLimit) break;

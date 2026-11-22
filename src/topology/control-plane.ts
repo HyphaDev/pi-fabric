@@ -421,7 +421,7 @@ export class FabricControlPlane {
 
   async #drain(): Promise<void> {
     while (true) {
-      const tail = this.mesh.tail(this.#offset, 100);
+      const tail = this.mesh.tail(this.#offset, 100, { afterSequence: this.#lastSequence });
       this.#offset = tail.nextOffset;
       for (const event of tail.events) {
         if (event.sequence <= this.#lastSequence) continue;
