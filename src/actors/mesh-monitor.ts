@@ -36,9 +36,9 @@ export class ActorMeshMonitor {
     // is never filtered out as already delivered.
     const sequence = mesh.latestSequence();
     const offset = mesh.latestOffset();
-    // Mesh cursors encode the generation in the high 32 bits (MeshStore).
-    const sameGeneration = saved && Math.floor(saved.cursor / 2 ** 32) === Math.floor(offset / 2 ** 32);
-    this.#sequence = saved?.sequence ?? (!saved || sameGeneration ? sequence : undefined);
+    // Only a legacy cursor at the tip can inherit the current sequence. Older
+    // cursors must replay their byte backlog before recording a sequence.
+    this.#sequence = saved?.sequence ?? (!saved || saved.cursor === offset ? sequence : undefined);
     this.#offset = saved?.cursor ?? offset;
   }
 

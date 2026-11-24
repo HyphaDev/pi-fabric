@@ -36,6 +36,30 @@ function setup(cursor?: string) {
 
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 
+it("replays exactly three pending events from a legacy cursor in the same generation", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-legacy-backlog-"));
+  roots.push(root);
+  const mesh = new MeshStore(root, 1024, 100);
+  const publish = () => mesh.publish({ topic: "test", from: { id: "peer", name: "peer", kind: "main" }, text: "backlog" });
+  await publish();
+  const cursor = mesh.latestOffset();
+  const cursorPath = path.join(root, "cursor.json");
+  fs.writeFileSync(cursorPath, JSON.stringify({ format: 1, cursor }));
+  const pending = [await publish(), await publish(), await publish()];
+  expect(Math.floor(cursor / 2 ** 32)).toBe(Math.floor(mesh.latestOffset() / 2 ** 32));
+  const delivered: number[] = [];
+  const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 100 }, {
+    cursorPath, beforePoll: () => true, onEvent: event => { delivered.push(event.sequence); },
+  });
+  monitors.push(monitor);
+  monitor.schedule();
+  await flush();
+  expect(delivered).toEqual(pending.map(event => event.sequence));
+  monitor.schedule();
+  await flush();
+  expect(delivered).toEqual(pending.map(event => event.sequence));
+});
+
 it("seeds a legacy cursor before compaction without replaying retained events", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-legacy-"));
   roots.push(root);
@@ -120,7 +144,7 @@ describe("ActorMeshMonitor", () => {
     s.monitor.schedule();
     s.monitor.schedule();
     await flush();
-    expect(s.mesh.tail).toHaveBeenCalledExactlyOnceWith(3, 7, { afterSequence: 0 });
+    expect(s.mesh.tail).toHaveBeenCalledExactlyOnceWith(3, 7);
     expect(s.onEvent).toHaveBeenCalledOnce();
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8"))).toEqual({ format: 1, cursor: 20 });
   });
@@ -182,7 +206,7 @@ describe("ActorMeshMonitor", () => {
     fs.mkdirSync(s.cursorPath);
     s.monitor.schedule();
     await flush();
-    expect(s.mesh.tail).toHaveBeenLastCalledWith(20, 7, { afterSequence: 0 });
+    expect(s.mesh.tail).toHaveBeenLastCalledWith(20, 7);
     expect(s.onEvent).toHaveBeenCalledTimes(2);
   });
 });
