@@ -64,6 +64,30 @@ it("resumes a persisted actor cursor after compaction without redelivery", async
   await flush();
   expect(delivered.filter((value) => value === fresh.sequence)).toHaveLength(1);
 });
+it("detects appends despite missed watcher notifications without idle tail reads", async () => {
+  vi.useFakeTimers();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-missed-watch-"));
+  roots.push(root);
+  const mesh = new MeshStore(root, 1024, 100);
+  const watcher = Object.assign(new EventEmitter(), { close: vi.fn() });
+  vi.spyOn(fs, "watch").mockReturnValue(watcher as unknown as FSWatcher);
+  const delivered: number[] = [];
+  const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 100 }, {
+    beforePoll: () => true, onEvent: event => { delivered.push(event.sequence); },
+  });
+  monitors.push(monitor);
+  monitor.start();
+  await flush();
+  const tail = vi.spyOn(mesh, "tail");
+  await vi.advanceTimersByTimeAsync(100);
+  expect(tail).not.toHaveBeenCalled();
+  const event = await mesh.publish({ topic: "test", from: { id: "peer", name: "peer", kind: "main" }, text: "missed notification" });
+  await vi.advanceTimersByTimeAsync(50);
+  expect(delivered).toEqual([event.sequence]);
+  tail.mockClear();
+  await vi.advanceTimersByTimeAsync(100);
+  expect(tail).not.toHaveBeenCalled();
+});
 describe("ActorMeshMonitor", () => {
   it("coalesces notifications, preserves a halted cursor, and resumes in order", async () => {
     const s = setup('{"format":1,"cursor":3}');

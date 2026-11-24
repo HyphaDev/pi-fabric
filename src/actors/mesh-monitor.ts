@@ -55,7 +55,7 @@ export class ActorMeshMonitor {
       });
       this.#watcher = watcher;
       watcher.on("error", () => this.#fallback(watcher));
-      this.#startTimer(Math.max(MESH_WATCH_RECONCILE_MS, this.config.actorPollMs));
+      this.#startTimer(Math.max(MESH_WATCH_RECONCILE_MS, this.config.actorPollMs), true);
     } catch {
       this.#startTimer(this.config.actorPollMs);
     }
@@ -105,13 +105,32 @@ export class ActorMeshMonitor {
     }, Math.min(Math.max(0, dueAt - Date.now()), 2_147_000_000));
     this.#dueTimer.unref();
   }
-
-  #startTimer(delay: number): void {
+  #startTimer(delay: number, watch = false): void {
     if (this.#timer) clearInterval(this.#timer);
+    let reconciledAt = Date.now();
+    const fingerprint = (): string => ["events.jsonl", "schedules.json"].map(name => {
+      try {
+        const stat = fs.statSync(path.join(this.mesh.root, name), { bigint: true });
+        return `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+      } catch { return "missing"; }
+    }).join("|");
+    let observed = watch ? fingerprint() : "";
     this.#timer = setInterval(() => {
-      this.callbacks.onReconcile?.();
+      const now = Date.now();
+      if (watch) {
+        const current = fingerprint();
+        const changed = current !== observed;
+        observed = current;
+        if (!changed && now - reconciledAt < delay) return;
+      }
+      if (!watch || now - reconciledAt >= delay) {
+        reconciledAt = now;
+        this.callbacks.onReconcile?.();
+      }
+      // Native watchers can miss notifications, especially immediately after
+      // registration. Stat at actorPollMs, but do no idle registry/tail reads.
       this.schedule();
-    }, delay);
+    }, watch ? Math.min(delay, this.config.actorPollMs) : delay);
     this.#timer.unref();
   }
 
