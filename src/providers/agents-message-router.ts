@@ -35,11 +35,6 @@ export class AgentMessageRouter {
       .find((participant) => participant.id === id && participant.controlProtocol === "v1");
   }
 
-  /**
-   * Main's control endpoint. A Main session hosts its own control plane under
-   * its identity, so a child can address it even when no live record is
-   * readable; the owner acknowledges or the request reports it unconfirmed.
-   */
   /** Legacy mesh relay; carries an explicit triggerTurn to receivers that read it. */
   #relay(
     id: string,
@@ -53,6 +48,11 @@ export class AgentMessageRouter {
       : this.actorManager.steerRemote(id, message, kind, data);
   }
 
+  /**
+   * Main's control endpoint. A Main session hosts its own control plane under
+   * its identity, so a child can address it even when no live record is
+   * readable; the owner acknowledges or the request reports it unconfirmed.
+   */
   #mainEndpoint(): FabricParticipantInfo {
     const id = this.mainAgent.id;
     const live = this.participants.get(id);

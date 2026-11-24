@@ -36,6 +36,26 @@ function setup(cursor?: string) {
 
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 
+it("seeds a legacy cursor before compaction without replaying retained events", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-legacy-"));
+  roots.push(root);
+  const mesh = new MeshStore(root, 1024, 100, { maxEventLogBytes: 6000, retainedEventLogBytes: 4000 });
+  const publish = () => mesh.publish({ topic: "test", from: { id: "peer", name: "peer", kind: "main" }, text: "x".repeat(300) });
+  for (let i = 0; i < 6; i++) await publish();
+  const sequence = mesh.latestSequence();
+  const cursorPath = path.join(root, "cursor.json");
+  fs.writeFileSync(cursorPath, JSON.stringify({ format: 1, cursor: mesh.latestOffset() }));
+  const delivered: number[] = [];
+  const monitor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 50, maxReadEvents: 100 }, {
+    cursorPath, beforePoll: () => true, onEvent: event => { delivered.push(event.sequence); },
+  });
+  monitors.push(monitor);
+  while (!fs.existsSync(path.join(root, "generation"))) await publish();
+  const fresh = await publish();
+  monitor.schedule();
+  await flush();
+  expect(delivered).toEqual(Array.from({ length: fresh.sequence - sequence }, (_, i) => sequence + i + 1));
+});
 it("resumes a persisted actor cursor after compaction without redelivery", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-generation-"));
   roots.push(root);
@@ -100,7 +120,7 @@ describe("ActorMeshMonitor", () => {
     s.monitor.schedule();
     s.monitor.schedule();
     await flush();
-    expect(s.mesh.tail).toHaveBeenCalledExactlyOnceWith(3, 7);
+    expect(s.mesh.tail).toHaveBeenCalledExactlyOnceWith(3, 7, { afterSequence: 0 });
     expect(s.onEvent).toHaveBeenCalledOnce();
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8"))).toEqual({ format: 1, cursor: 20 });
   });
@@ -162,7 +182,7 @@ describe("ActorMeshMonitor", () => {
     fs.mkdirSync(s.cursorPath);
     s.monitor.schedule();
     await flush();
-    expect(s.mesh.tail).toHaveBeenLastCalledWith(20, 7);
+    expect(s.mesh.tail).toHaveBeenLastCalledWith(20, 7, { afterSequence: 0 });
     expect(s.onEvent).toHaveBeenCalledTimes(2);
   });
 });
