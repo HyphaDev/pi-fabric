@@ -47,6 +47,22 @@ afterEach(async () => {
 });
 
 describe("FabricControlPlane", () => {
+  it("does not scan seen claims during idle polling", async () => {
+    vi.useFakeTimers();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-idle-"));
+    roots.push(root);
+    const receiver = plane(path.join(root, "mesh"), "host:idle");
+    const listing = vi.spyOn(MeshStore.prototype, "listAll");
+    try {
+      receiver.start(() => ({ accepted: true }));
+      await vi.advanceTimersByTimeAsync(3500);
+      expect(listing).not.toHaveBeenCalled();
+    } finally {
+      await receiver.close();
+      listing.mockRestore();
+      vi.useRealTimers();
+    }
+  });
   it("routes to one execution owner and returns its acknowledgement", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);

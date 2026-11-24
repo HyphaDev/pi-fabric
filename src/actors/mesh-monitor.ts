@@ -34,8 +34,12 @@ export class ActorMeshMonitor {
     // Read the sequence before the offset: an append between the two reads
     // then lands past both, or past the offset only (skipped, as before), and
     // is never filtered out as already delivered.
-    this.#sequence = saved ? saved.sequence : mesh.latestSequence();
-    this.#offset = saved?.cursor ?? mesh.latestOffset();
+    const sequence = mesh.latestSequence();
+    const offset = mesh.latestOffset();
+    // Mesh cursors encode the generation in the high 32 bits (MeshStore).
+    const sameGeneration = saved && Math.floor(saved.cursor / 2 ** 32) === Math.floor(offset / 2 ** 32);
+    this.#sequence = saved?.sequence ?? (!saved || sameGeneration ? sequence : undefined);
+    this.#offset = saved?.cursor ?? offset;
   }
 
   start(): void {
@@ -128,7 +132,7 @@ export class ActorMeshMonitor {
         this.callbacks.onReconcile?.();
       }
       // Native watchers can miss notifications, especially immediately after
-      // registration. Stat at actorPollMs, but do no idle registry/tail reads.
+      // registration. Stat at actorPollMs; reconcile and tail at least every delay.
       this.schedule();
     }, watch ? Math.min(delay, this.config.actorPollMs) : delay);
     this.#timer.unref();

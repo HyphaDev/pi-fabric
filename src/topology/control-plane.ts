@@ -481,6 +481,7 @@ export class FabricControlPlane {
   }
 
   async #drain(): Promise<void> {
+    let handledCommand = false;
     while (true) {
       const tail = this.mesh.tail(this.#offset, 100, { afterSequence: this.#lastSequence });
       this.#offset = tail.nextOffset;
@@ -489,13 +490,16 @@ export class FabricControlPlane {
         this.#lastSequence = event.sequence;
         if (event.to !== this.options.hostId) continue;
         if (event.topic === ACK_TOPIC) this.#acceptAcknowledgement(event);
-        else if (event.topic === CONTROL_TOPIC) await this.#acceptCommand(event);
+        else if (event.topic === CONTROL_TOPIC) {
+          handledCommand = true;
+          await this.#acceptCommand(event);
+        }
       }
       if (tail.events.length < 100) break;
     }
     // Pruning expired claims scans the log; it runs after this batch so it
     // never delays an acknowledgement.
-    await this.#cleanupSeen(Date.now());
+    if (handledCommand) await this.#cleanupSeen(Date.now());
   }
 
   #acceptAcknowledgement(event: MeshEvent): void {
