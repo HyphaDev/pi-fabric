@@ -9,6 +9,54 @@ const message = (text: string) => ({ role: "user" as const, content: text, times
 const large = "λ漢字\\n\"".repeat(8000);
 
 describe("inactive session payload paging", () => {
+  it("keeps cold payloads readable after path removal across 50 paging passes", async () => {
+    const opened = vi.spyOn(fs, "openSync");
+    const cold = vi.spyOn(WeakRef.prototype, "deref").mockReturnValue(undefined);
+    try {
+      const manager = SessionManager.inMemory();
+      const retained: { content: string }[] = [];
+      for (let turn = 0; turn < 50; turn++) {
+        const content = `${turn}: ${large}`;
+        const id = manager.appendMessage(message(content));
+        manager.appendCompaction("summary", null, 10000);
+        expect((await pageSessionHistory(manager)).entries).toBe(1);
+        const cached = Object.getOwnPropertyDescriptor(manager.getEntry(id)!, "message")!.value as { content: string };
+        retained.push(cached);
+        const paths = opened.mock.calls.map(call => String(call[0])).filter(file => file.endsWith("payloads.jsonl"));
+        expect(paths.length).toBeGreaterThan(0);
+        for (const file of paths) {
+          if (process.platform !== "win32") {
+            fs.rmSync(file, { force: true });
+            expect(fs.existsSync(path.dirname(file))).toBe(false);
+          }
+        }
+        for (let earlier = 0; earlier <= turn; earlier++) {
+          expect(retained[earlier]!.content).toBe(`${earlier}: ${large}`);
+          expect(retained[earlier]!.content).toBe(`${earlier}: ${large}`);
+        }
+      }
+      expect(opened.mock.calls.filter(call => String(call[0]).endsWith("payloads.jsonl"))).toHaveLength(1);
+    } finally { cold.mockRestore(); opened.mockRestore(); }
+  });
+
+  it.each(["short read", "EBADF"])("reports a cold %s failure without hiding content loss", async failure => {
+    const manager = SessionManager.inMemory();
+    const id = manager.appendMessage(message(large));
+    manager.appendCompaction("summary", null, 10000);
+    await pageSessionHistory(manager);
+    const cached = Object.getOwnPropertyDescriptor(manager.getEntry(id)!, "message")!.value as { content: string };
+    const cold = vi.spyOn(WeakRef.prototype, "deref").mockReturnValue(undefined);
+    const read = vi.spyOn(fs, "readSync");
+    if (failure === "short read") read.mockReturnValue(0);
+    else read.mockImplementation(() => { throw new Error("EBADF: bad file descriptor"); });
+    try {
+      expect(() => cached.content).toThrow(failure === "short read"
+        ? "Historical payload could not be read: Historical payload archive is incomplete"
+        : "Historical payload could not be read: EBADF: bad file descriptor");
+    } finally { read.mockRestore(); cold.mockRestore(); }
+    expect(cached.content).toBe(large);
+  });
+
   it("preserves entry identities, JSON, branch navigation and current context", async () => {
     const manager = SessionManager.inMemory();
     const first = manager.appendMessage(message(large));
