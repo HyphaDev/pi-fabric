@@ -3,14 +3,35 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { pageSessionHistory } from "../src/memory/history-paging.js";
+import { pageSessionHistory, __historyPagingTest } from "../src/memory/history-paging.js";
 
 const message = (text: string) => ({ role: "user" as const, content: text, timestamp: 1 });
 const large = "λ漢字\\n\"".repeat(8000);
 
 describe("inactive session payload paging", () => {
-  it("keeps cold payloads readable after path removal across 50 paging passes", async () => {
+  it("rotates at the cap and cold-reads both unlinked archives", async () => {
+    __historyPagingTest.setMaxArchiveBytes(1);
     const opened = vi.spyOn(fs, "openSync");
+    const cold = vi.spyOn(WeakRef.prototype, "deref").mockReturnValue(undefined);
+    try {
+      const manager = SessionManager.inMemory();
+      const ids = [manager.appendMessage(message(`old:${large}`)), manager.appendMessage(message(`new:${large}`))];
+      manager.appendCompaction("summary", null, 10000);
+      expect((await pageSessionHistory(manager)).entries).toBe(2);
+      const paths = opened.mock.calls.map(call => String(call[0])).filter(file => file.endsWith("payloads.jsonl"));
+      expect(paths).toHaveLength(2);
+      if (process.platform !== "win32") for (const file of paths) {
+        fs.rmSync(file, { force: true });
+        expect(fs.existsSync(file)).toBe(false);
+      }
+      for (const [index, id] of ids.entries()) {
+        const cached = Object.getOwnPropertyDescriptor(manager.getEntry(id)!, "message")!.value;
+        expect(cached.content).toBe(`${index === 0 ? "old" : "new"}:${large}`);
+      }
+    } finally { __historyPagingTest.setMaxArchiveBytes(); cold.mockRestore(); opened.mockRestore(); }
+  });
+  it("keeps cold payloads readable after path removal across 50 paging passes", async () => {
+    const written = vi.spyOn(fs, "writeSync");
     const cold = vi.spyOn(WeakRef.prototype, "deref").mockReturnValue(undefined);
     try {
       const manager = SessionManager.inMemory();
@@ -22,23 +43,83 @@ describe("inactive session payload paging", () => {
         expect((await pageSessionHistory(manager)).entries).toBe(1);
         const cached = Object.getOwnPropertyDescriptor(manager.getEntry(id)!, "message")!.value as { content: string };
         retained.push(cached);
-        const paths = opened.mock.calls.map(call => String(call[0])).filter(file => file.endsWith("payloads.jsonl"));
-        expect(paths.length).toBeGreaterThan(0);
-        for (const file of paths) {
-          if (process.platform !== "win32") {
-            fs.rmSync(file, { force: true });
-            expect(fs.existsSync(path.dirname(file))).toBe(false);
-          }
+        const fds = new Set(written.mock.calls.map(call => call[0]));
+        expect(fds.size).toBeGreaterThan(0);
+        if (process.platform !== "win32") for (const fd of fds) {
+          expect(fs.fstatSync(fd).nlink).toBe(0);
         }
         for (let earlier = 0; earlier <= turn; earlier++) {
           expect(retained[earlier]!.content).toBe(`${earlier}: ${large}`);
           expect(retained[earlier]!.content).toBe(`${earlier}: ${large}`);
         }
       }
-      expect(opened.mock.calls.filter(call => String(call[0]).endsWith("payloads.jsonl"))).toHaveLength(1);
-    } finally { cold.mockRestore(); opened.mockRestore(); }
+    } finally { cold.mockRestore(); written.mockRestore(); }
   });
 
+  it("releases an aborted pass's writer lease", async () => {
+    __historyPagingTest.setMaxArchiveBytes(1);
+    try {
+      const manager = SessionManager.inMemory();
+      for (let i = 0; i < 96; i++) manager.appendMessage(message(`${i}:${large}`));
+      manager.appendCompaction("summary", null, 10000);
+      const controller = new AbortController();
+      const pending = pageSessionHistory(manager, controller.signal);
+      const archive = __historyPagingTest.archives().at(-1)!;
+      expect(archive.writers).toBe(1);
+      controller.abort();
+      const result = await pending;
+      expect(result.entries).toBeGreaterThan(0);
+      expect(result.entries).toBeLessThan(96);
+      expect(archive.writers).toBe(0);
+      expect(() => archive.write("later")).toThrow("closed for writing");
+    } finally { __historyPagingTest.setMaxArchiveBytes(); }
+  });
+
+  it("closes an ownerless archive on write failure and preserves the cause", async () => {
+    __historyPagingTest.setMaxArchiveBytes(1);
+    const manager = SessionManager.inMemory();
+    const id = manager.appendMessage(message(large));
+    manager.appendCompaction("summary", null, 10000);
+    const cause = new Error("ENOSPC: no space left");
+    let archive: ReturnType<typeof __historyPagingTest.archives>[number] | undefined;
+    const write = vi.spyOn(fs, "writeSync").mockImplementation(() => {
+      archive = __historyPagingTest.archives().at(-1);
+      throw cause;
+    });
+    try {
+      await expect(pageSessionHistory(manager)).rejects.toMatchObject({
+        message: "Historical payload could not be written: ENOSPC: no space left", cause,
+      });
+      expect(archive).toBeDefined();
+      expect(archive!.writers).toBe(0);
+      expect(archive!.closed).toBe(true);
+      expect(archive!.fd).toBeUndefined();
+      expect(Object.getOwnPropertyDescriptor(manager.getEntry(id)!, "message")!.value.content).toBe(large);
+    } finally { write.mockRestore(); __historyPagingTest.setMaxArchiveBytes(); }
+  });
+
+  it("shares the newest archive between concurrent sessions with intact cold reads", async () => {
+    const managers = [SessionManager.inMemory(), SessionManager.inMemory()];
+    const ids = managers.map((manager, session) => {
+      const ids = Array.from({ length: 40 }, (_, index) => manager.appendMessage(message(`${session}:${index}:${large}`)));
+      manager.appendCompaction("summary", null, 10000);
+      return ids;
+    });
+    const newest = __historyPagingTest.archives().at(-1);
+    const write = vi.spyOn(fs, "writeSync");
+    const cold = vi.spyOn(WeakRef.prototype, "deref").mockReturnValue(undefined);
+    try {
+      const results = await Promise.all(managers.map(manager => pageSessionHistory(manager)));
+      expect(results.map(result => result.entries)).toEqual([40, 40]);
+      const fds = new Set(write.mock.calls.map(call => call[0]));
+      expect(fds.size).toBe(1);
+      if (newest && newest.offset < 64 * 1024 * 1024) expect([...fds]).toEqual([newest.fd]);
+      for (const [session, manager] of managers.entries()) for (const [index, id] of ids[session]!.entries()) {
+        const cached = Object.getOwnPropertyDescriptor(manager.getEntry(id)!, "message")!.value;
+        expect(cached.content).toBe(`${session}:${index}:${large}`);
+      }
+    } finally { write.mockRestore(); cold.mockRestore(); }
+  });
   it.each(["short read", "EBADF"])("reports a cold %s failure without hiding content loss", async failure => {
     const manager = SessionManager.inMemory();
     const id = manager.appendMessage(message(large));

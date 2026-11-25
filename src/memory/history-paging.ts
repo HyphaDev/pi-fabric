@@ -8,6 +8,13 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 const MIN_PAGE_BYTES = 16 * 1024;
 const openArchives = new Set<PayloadArchive>();
 let exitCleanupInstalled = false;
+const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
+let maxArchiveBytes = MAX_ARCHIVE_BYTES;
+/** Test-only controls for bounded rotation and deterministic lease inspection. */
+export const __historyPagingTest = {
+  setMaxArchiveBytes(bytes = MAX_ARCHIVE_BYTES): void { maxArchiveBytes = bytes; },
+  archives: () => [...openArchives],
+};
 
 class PayloadArchive {
   readonly directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-history-"));
@@ -38,17 +45,21 @@ class PayloadArchive {
   }
 
   write(json: string): { offset: number; bytes: number } {
-    if (this.closed || this.fd === undefined || this.writers === 0) throw new Error("Historical payload archive is closed for writing");
-    const data = Buffer.from(json, "utf8");
-    const offset = this.offset;
-    let written = 0;
-    while (written < data.length) {
-      const count = fs.writeSync(this.fd, data, written, data.length - written, offset + written);
-      if (count === 0) throw new Error("Could not write historical payload archive");
-      written += count;
+    try {
+      if (this.closed || this.fd === undefined || this.writers === 0) throw new Error("Historical payload archive is closed for writing");
+      const data = Buffer.from(json, "utf8");
+      const offset = this.offset;
+      let written = 0;
+      while (written < data.length) {
+        const count = fs.writeSync(this.fd, data, written, data.length - written, offset + written);
+        if (count === 0) throw new Error("Could not write historical payload archive");
+        written += count;
+      }
+      this.offset += written;
+      return { offset, bytes: written };
+    } catch (error) {
+      throw new Error(`Historical payload could not be written: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
-    this.offset += written;
-    return { offset, bytes: written };
   }
 
   read(slot: { offset: number; bytes: number }): unknown {
@@ -156,8 +167,11 @@ export async function pageSessionHistory(
             try { json = JSON.stringify(value); } catch { /* keep non-JSON state in memory */ }
             if (json === undefined || Buffer.byteLength(json, "utf8") < MIN_PAGE_BYTES) continue;
             if (typeof value === "object" && json[0] !== "{" && json[0] !== "[") continue;
-            if (!archive) {
-              archive = openArchives.values().next().value ?? new PayloadArchive();
+            if (!archive || archive.offset >= maxArchiveBytes) {
+              archive?.finishWrites();
+              archive = undefined;
+              const newest = [...openArchives].at(-1);
+              archive = newest && newest.offset < maxArchiveBytes ? newest : new PayloadArchive();
               archive.beginWrites();
             }
             const slot = archive.write(json);

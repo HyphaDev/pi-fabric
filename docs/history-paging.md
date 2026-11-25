@@ -44,10 +44,14 @@ other extensions are not replaced. Unsupported host adapters are skipped.
   read-capable descriptor serves every cold read; reads never reopen a path.
   On POSIX, the file is unlinked and its directory removed as soon as it opens,
   so temporary-file cleaners cannot invalidate retained history. Windows keeps
-  the path until cleanup. Paging passes append to one shared archive while it
-  has owners, bounding descriptors to one per loaded paging module. Each pass
-  holds a writer lease until it finishes, including cancellation and failure.
-  The descriptor closes when all owners are collected or at process exit.
+  the path until cleanup. Paging passes reuse the newest archive while it is below
+  64 MiB, then open a new archive. A single payload can exceed this cap.
+  Descriptors scale with retained paged bytes divided by the cap, with extra space
+  for the final payload in each archive. Each pass holds a writer lease until it
+  finishes, including cancellation and failure. Old archives close independently
+  once all their owners are collected, or at process exit. An unlinked file still
+  uses disk until its descriptor closes; `du` and `ls` do not show it. On POSIX,
+  use `lsof +L1` to inspect these open, deleted files.
   Windows crashes may leave temporary files containing conversation data.
   Read failures report the cause and never return missing content.
 - History browsing, export or other consumers can hydrate many messages again.
