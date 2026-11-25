@@ -40,11 +40,16 @@ other extensions are not replaced. Unsupported host adapters are skipped.
 - Paged objects are JSON snapshots, not cross-GC identity guarantees. Non-JSON payloads
   which fail serialization stay in memory. Small payloads and custom entries also
   remain resident. Metadata and active context are not bounded by this feature.
-- Archives use a private temporary directory and a mode-0600 file. They are kept
-  until their entries are collected so a retained entry is still readable after
-  a session switch or extension reload. Normal process exit removes archives;
-  a crash may leave temporary files for the OS/user to clean up. They contain
-  conversation data, like the original session logs.
+- Archives use a private temporary directory and a mode-0600 file. A held
+  read-capable descriptor serves every cold read; reads never reopen a path.
+  On POSIX, the file is unlinked and its directory removed as soon as it opens,
+  so temporary-file cleaners cannot invalidate retained history. Windows keeps
+  the path until cleanup. Paging passes append to one shared archive while it
+  has owners, bounding descriptors to one per loaded paging module. Each pass
+  holds a writer lease until it finishes, including cancellation and failure.
+  The descriptor closes when all owners are collected or at process exit.
+  Windows crashes may leave temporary files containing conversation data.
+  Read failures report the cause and never return missing content.
 - History browsing, export or other consumers can hydrate many messages again.
   Those payloads become collectible after readers let go. This does not promise
   low peak memory while opening an existing large session, nor immediate RSS

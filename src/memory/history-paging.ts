@@ -14,12 +14,22 @@ class PayloadArchive {
   readonly file = path.join(this.directory, "payloads.jsonl");
   fd: number | undefined;
   offset = 0;
-  owners = 1;
+  owners = 0;
+  writers = 0;
   closed = false;
 
   constructor() {
-    try { this.fd = fs.openSync(this.file, "wx+", 0o600); }
-    catch (error) { fs.rmSync(this.directory, { recursive: true, force: true }); throw error; }
+    try {
+      this.fd = fs.openSync(this.file, "wx+", 0o600);
+      if (process.platform !== "win32") {
+        fs.unlinkSync(this.file);
+        fs.rmdirSync(this.directory);
+      }
+    } catch (error) {
+      if (this.fd !== undefined) fs.closeSync(this.fd);
+      fs.rmSync(this.directory, { recursive: true, force: true });
+      throw error;
+    }
     openArchives.add(this);
     if (!exitCleanupInstalled) {
       exitCleanupInstalled = true;
@@ -28,7 +38,7 @@ class PayloadArchive {
   }
 
   write(json: string): { offset: number; bytes: number } {
-    if (this.closed || this.fd === undefined) throw new Error("Historical payload archive is closed for writing");
+    if (this.closed || this.fd === undefined || this.writers === 0) throw new Error("Historical payload archive is closed for writing");
     const data = Buffer.from(json, "utf8");
     const offset = this.offset;
     let written = 0;
@@ -42,10 +52,9 @@ class PayloadArchive {
   }
 
   read(slot: { offset: number; bytes: number }): unknown {
-    if (this.closed) throw new Error("Historical payload archive is closed");
-    const held = this.fd;
-    const fd = held ?? fs.openSync(this.file, "r");
     try {
+      if (this.closed || this.fd === undefined) throw new Error("archive is closed");
+      const fd = this.fd;
       const data = Buffer.allocUnsafe(slot.bytes);
       let read = 0;
       while (read < data.length) {
@@ -54,13 +63,20 @@ class PayloadArchive {
         read += count;
       }
       return JSON.parse(data.toString("utf8")) as unknown;
-    } finally { if (held === undefined) fs.closeSync(fd); }
+    } catch (error) {
+      throw new Error(`Historical payload could not be read: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    }
+  }
+
+  beginWrites(): void {
+    if (this.closed) throw new Error("Historical payload archive is closed for writing");
+    this.writers++;
+    this.owners++;
   }
 
   finishWrites(): void {
-    const fd = this.fd;
-    this.fd = undefined;
-    try { if (fd !== undefined) fs.closeSync(fd); } finally { this.release(); }
+    this.writers--;
+    this.release();
   }
 
   release(): void { if (--this.owners === 0) this.close(); }
@@ -140,7 +156,10 @@ export async function pageSessionHistory(
             try { json = JSON.stringify(value); } catch { /* keep non-JSON state in memory */ }
             if (json === undefined || Buffer.byteLength(json, "utf8") < MIN_PAGE_BYTES) continue;
             if (typeof value === "object" && json[0] !== "{" && json[0] !== "[") continue;
-            archive ??= new PayloadArchive();
+            if (!archive) {
+              archive = openArchives.values().next().value ?? new PayloadArchive();
+              archive.beginWrites();
+            }
             const slot = archive.write(json);
             installPayload(message, key, value, field.enumerable === true, field.writable === true, archive, slot);
             paged = true;
