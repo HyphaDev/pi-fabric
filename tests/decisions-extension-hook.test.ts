@@ -251,7 +251,8 @@ describe("pi-fabric:decisions:changed:v1", () => {
     const flaky: DecisionFeedMesh = {
       root: mesh.root,
       latestOffset: () => mesh.latestOffset(),
-      tail: (cursor, limit) => mesh.tail(cursor, limit),
+      latestSequence: () => mesh.latestSequence(),
+      tail: (cursor, limit, options) => mesh.tail(cursor, limit, options),
       get: (key) => {
         reads += 1;
         if (failing) throw new Error("EBUSY: state file locked");
@@ -295,7 +296,8 @@ describe("pi-fabric:decisions:changed:v1", () => {
     const observed: DecisionFeedMesh = {
       root: mesh.root,
       latestOffset: () => mesh.latestOffset(),
-      tail: (cursor, limit) => mesh.tail(cursor, limit),
+      latestSequence: () => mesh.latestSequence(),
+      tail: (cursor, limit, options) => mesh.tail(cursor, limit, options),
       get: (key) => {
         reads += 1;
         return mesh.get(key);

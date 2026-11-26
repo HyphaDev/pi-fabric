@@ -29,7 +29,7 @@ const DECISION_ID = /^dec_[A-Za-z0-9_-]{8,64}$/;
 const MAX_TRACKED_DECISIONS = 2_000;
 const MAX_RETRY_DECISIONS = 500;
 
-export type DecisionFeedMesh = Pick<MeshStore, "root" | "latestOffset" | "tail" | "get">;
+export type DecisionFeedMesh = Pick<MeshStore, "root" | "latestOffset" | "latestSequence" | "tail" | "get">;
 
 export class DecisionChangeFeed {
   #emitted = new Map<string, number>();
@@ -54,7 +54,12 @@ export class DecisionChangeFeed {
     // Only the read side of the mesh: the monitor must not release schedules.
     const mesh = this.mesh;
     this.#monitor = new ActorMeshMonitor(
-      { root: mesh.root, latestOffset: () => mesh.latestOffset(), tail: (cursor, limit) => mesh.tail(cursor, limit) },
+      {
+        root: mesh.root,
+        latestOffset: () => mesh.latestOffset(),
+        latestSequence: () => mesh.latestSequence(),
+        tail: (cursor, limit, options) => mesh.tail(cursor, limit, options),
+      },
       { enabled: true, actorPollMs: this.config.actorPollMs, maxReadEvents: this.config.maxReadEvents },
       { beforePoll: () => this.#beforePoll(), onEvent: (event) => this.#onEvent(event) },
     );
